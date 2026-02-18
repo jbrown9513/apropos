@@ -1,0 +1,21 @@
+{
+  "name": "apropos",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local dashboard and MCP observability proxy for project workflows",
+  "scripts": {
+    "postinstall": "npm rebuild node-pty",
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "nanoid": "^5.1.5",
+    "node-pty": "^1.1.0",
+    "ws": "^8.19.0"
+  }
+}

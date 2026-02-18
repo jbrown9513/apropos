@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Apropos</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css" />
+    <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-attach@0.11.0/lib/addon-attach.min.js"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="noise"></div>
+    <div class="notification-shell">
+      <div class="notification-toolbar" aria-label="Project toolbar">
+        <label class="project-switcher" data-project-switcher hidden>
+          <span class="sr-only">Active project</span>
+          <select id="projectSwitcher" aria-label="Active project"></select>
+        </label>
+        <button
+          id="notificationToggle"
+          class="notification-toggle"
+          type="button"
+          aria-label="Notifications"
+          aria-haspopup="true"
+          aria-expanded="false"
+          aria-controls="notificationCenter"
+        >
+          <svg class="notification-icon" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M12 22a2.5 2.5 0 0 0 2.4-2h-4.8a2.5 2.5 0 0 0 2.4 2Zm7-5H5v-1.3l1.4-1.4V10a5.6 5.6 0 1 1 11.2 0v4.3l1.4 1.4V17Z" />
+          </svg>
+          <span class="sr-only">Notifications</span>
+          <span id="notificationBadge" class="notification-badge" hidden>0</span>
+        </button>
+      </div>
+      <aside id="notificationCenter" class="notification-center" aria-live="polite" hidden>
+        <div class="notification-head">
+          <h2>Notifications</h2>
+          <button id="notificationDismissAll" class="small alt notification-dismiss-all" type="button">Dismiss all</button>
+        </div>
+        <div id="notificationGroups" class="notification-groups"></div>
+        <p id="notificationEmpty" class="mono notification-empty">No notifications.</p>
+      </aside>
+    </div>
+    <button id="addProjectFab" class="fab" title="Add project">+</button>
+    <header>
+      <h1>apropos</h1>
+      <p>coders dream dashboard for project control, MCP visibility, and launcher ops</p>
+      <div class="main-actions">
+        <button id="mainMcpAddRepoBtn" class="small" type="button">Set MCP Repo URL</button>
+      </div>
+      <div id="homePath"></div>
+    </header>
+
+    <main>
+      <section class="projects-wrap">
+        <h2>Projects</h2>
+        <div class="folder-toolbar">
+          <div id="folderTabs" class="folder-tabs"></div>
+          <div class="folder-actions">
+            <button id="removeFolderBtn" class="small alt" type="button">- folder</button>
+            <button id="addFolderBtn" class="small alt" type="button">+ folder</button>
+          </div>
+        </div>
+        <div id="projects" class="projects"></div>
+      </section>
+    </main>
+
+    <template id="projectTemplate">
+      <article class="project-card">
+        <div class="project-head">
+          <h3 class="project-name"></h3>
+          <div class="project-badges">
+            <button type="button" class="small alt remove-btn" data-remove-project>Remove</button>
+            <span class="git-badge"></span>
+            <span class="alert-icon" hidden>!</span>
+          </div>
+        </div>
+        <p class="project-path"></p>
+        <p class="project-meta"></p>
+        <div class="list mcp-list"></div>
+        <div class="list skills-list"></div>
+        <div class="list structure-list"></div>
+      </article>
+    </template>
+
+    <section id="workspace" class="workspace" hidden>
+      <div class="workspace-head">
+        <button id="closeWorkspace" class="small alt" type="button">Back</button>
+        <h2 id="workspaceTitle">Project Workspace</h2>
+      </div>
+      <div class="terminal-toolbar">
+        <button class="small" type="button" data-workspace-launch="tmux">+ tmux</button>
+        <button class="small" type="button" data-workspace-launch="codex">+ codex</button>
+        <button class="small" type="button" data-workspace-launch="claude">+ claude</button>
+        <button class="small" type="button" data-workspace-action="run-automation">RUN</button>
+        <button class="small" type="button" data-workspace-action="mcp">MCP</button>
+        <button class="small" type="button" data-workspace-action="skills">SKILLS</button>
+        <button class="small" type="button" data-workspace-action="agents">AGENTS</button>
+        <button class="small" type="button" data-workspace-action="logs">LOGS</button>
+      </div>
+      <section id="workspaceEditor" class="workspace-editor" hidden>
+        <div class="workspace-editor-head">
+          <h3 id="workspaceEditorTitle">Editor</h3>
+          <button class="small alt" type="button" data-editor-close>Close</button>
+        </div>
+        <div id="workspaceEditorMeta" class="workspace-editor-meta">
+          <label data-editor-skill-select hidden>
+            Skill
+            <select id="workspaceEditorSkillSelect"></select>
+          </label>
+          <div data-editor-skill-actions hidden>
+            <button class="small alt" type="button" data-skill-add>Add</button>
+            <button class="small alt" type="button" data-skill-remove>Remove</button>
+          </div>
+          <label data-editor-docs-file hidden>
+            docs file
+            <select id="workspaceEditorDocsFile"></select>
+          </label>
+        </div>
+        <textarea id="workspaceEditorInput" class="workspace-editor-input mono"></textarea>
+        <div class="workspace-editor-actions">
+          <button class="small" type="button" data-editor-save>Save</button>
+          <button class="small alt" type="button" data-editor-close>Cancel</button>
+        </div>
+      </section>
+      <section id="workspaceLogs" class="workspace-logs" hidden>
+        <div class="workspace-editor-head">
+          <h3>MCP Proxy Logs</h3>
+          <button class="small alt" type="button" data-logs-clear>Clear</button>
+        </div>
+        <pre id="workspaceLogsOutput" class="workspace-logs-output mono"></pre>
+      </section>
+      <div id="workspaceSplit" class="workspace-split" hidden>
+        <div id="terminalGridSplit" class="terminal-grid"></div>
+        <section id="workspaceLogsPane" class="workspace-logs-pane">
+          <div class="workspace-editor-head">
+            <h3>MCP Proxy Logs</h3>
+            <div class="workspace-logs-pane-actions">
+              <button class="small alt" type="button" data-logs-clear>Clear</button>
+              <button class="small alt" type="button" data-workspace-action="logs">Hide</button>
+            </div>
+          </div>
+          <pre id="workspaceLogsOutputPane" class="workspace-logs-output mono"></pre>
+        </section>
+      </div>
+      <div class="session-kind-legend mono" aria-label="Session color legend">
+        <span class="legend-item"><i class="legend-dot legend-dot-tmux"></i> tmux</span>
+        <span class="legend-item"><i class="legend-dot legend-dot-codex"></i> codex</span>
+        <span class="legend-item"><i class="legend-dot legend-dot-claude"></i> claude</span>
+      </div>
+      <div id="terminalGrid" class="terminal-grid"></div>
+      <p id="terminalGridEmpty" class="mono">No active sessions for this project.</p>
+    </section>
+
+    <dialog id="appModal" class="dialog app-modal">
+      <form id="appModalForm" method="dialog">
+        <div class="app-modal-head">
+          <h3 id="appModalTitle">Dialog</h3>
+          <button type="button" class="small alt" id="appModalClose">Close</button>
+        </div>
+        <div id="appModalBody" class="app-modal-body"></div>
+        <div class="dialog-actions app-modal-actions">
+          <button type="button" class="small alt" id="appModalCancel">Cancel</button>
+          <button type="submit" class="small" id="appModalSubmit">OK</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div id="toast" class="toast mono" hidden></div>
+
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
