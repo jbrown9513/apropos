@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import { trackAlert, trackEvent } from './events.js';
 
-export async function proxyMcpRequest(targetName, targetUrl, body, headers = {}) {
+export async function proxyMcpRequest(targetName, targetUrl, body, headers = {}, context = {}) {
   const started = Date.now();
   const requestId = crypto.randomUUID();
   const sanitizedHeaders = {
@@ -26,7 +26,9 @@ export async function proxyMcpRequest(targetName, targetUrl, body, headers = {})
       targetUrl,
       status: response.status,
       durationMs,
-      method: body?.method
+      method: body?.method,
+      projectId: context?.projectId || null,
+      sessionId: context?.sessionId || null
     };
 
     await trackEvent('proxy.request', payload, response.ok ? 'info' : 'warning');
@@ -56,7 +58,9 @@ export async function proxyMcpRequest(targetName, targetUrl, body, headers = {})
       targetName,
       targetUrl,
       error: error.message,
-      method: body?.method
+      method: body?.method,
+      projectId: context?.projectId || null,
+      sessionId: context?.sessionId || null
     };
     await trackAlert('proxy.connection_failed', payload, 'critical');
 

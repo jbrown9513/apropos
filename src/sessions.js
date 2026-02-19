@@ -1,11 +1,12 @@
 import { execFile } from 'node:child_process';
 import { nanoid } from 'nanoid';
 import { trackAlert, trackEvent } from './events.js';
+import { ensureSessionRulesFiles } from './plugins/vcs-mappings.js';
 
 const sessions = [];
-const SESSION_PREFIX_RE = /^([A-Za-z0-9_-]+)-(tmux|codex|claude)-([A-Za-z0-9_-]+)$/;
+const SESSION_PREFIX_RE = /^([A-Za-z0-9_-]+)-(tmux|codex|claude|cursor|opencode)-([A-Za-z0-9_-]+)$/;
 const TMUX_BIN = process.env.TMUX_BIN || '/opt/homebrew/bin/tmux';
-const AGENT_KINDS = new Set(['codex', 'claude']);
+const AGENT_KINDS = new Set(['codex', 'claude', 'cursor', 'opencode']);
 const REMOTE_TMUX_CANDIDATES = [
   process.env.TMUX_BIN_REMOTE,
   process.env.TMUX_BIN,
@@ -13,6 +14,15 @@ const REMOTE_TMUX_CANDIDATES = [
   '/usr/local/bin/tmux',
   '/usr/bin/tmux'
 ].filter(Boolean);
+const TMUX_HISTORY_LIMIT_LINES = '50000';
+const SSH_SHARED_ARGS = [
+  '-o', 'ControlMaster=auto',
+  '-o', 'ControlPersist=10m',
+  '-o', 'ControlPath=/tmp/apropos-ssh-%C',
+  '-o', 'ConnectTimeout=8',
+  '-o', 'ServerAliveInterval=20',
+  '-o', 'ServerAliveCountMax=3'
+];
 
 function shellQuote(value) {
   return `'${String(value ?? '').replace(/'/g, `'\\''`)}'`;
@@ -30,7 +40,7 @@ function commandName(command) {
 function runSsh(sshHost, command, cwd) {
   return new Promise((resolve, reject) => {
     const wrapped = cwd ? `cd ${shellQuote(cwd)} && ${command}` : command;
-    execFile('ssh', [sshHost, wrapped], (error, stdout, stderr) => {
+    execFile('ssh', [...SSH_SHARED_ARGS, sshHost, wrapped], (error, stdout, stderr) => {
       if (error) {
         reject(new Error(stderr || error.message));
         return;
@@ -123,7 +133,7 @@ function parseTmuxName(tmuxName) {
   };
 }
 
-function buildCommand(kind, rawCommand, projectPath) {
+function buildCommand(kind, rawCommand, projectPath, isRemote = false) {
   if (kind === 'tmux') {
     if (rawCommand) {
       return rawCommand;
@@ -132,23 +142,37 @@ function buildCommand(kind, rawCommand, projectPath) {
     return `cd ${shellQuote(projectPath)} && exec ${shellQuote(shell)}`;
   }
   if (kind === 'codex') {
-    return rawCommand || 'codex';
+    return rawCommand || (isRemote ? 'npx -y @openai/codex' : 'codex');
   }
   if (kind === 'claude') {
     return rawCommand || 'claude';
   }
+  if (kind === 'cursor') {
+    return rawCommand || 'cursor-agent';
+  }
+  if (kind === 'opencode') {
+    return rawCommand || 'opencode';
+  }
   return rawCommand || process.env.SHELL || 'zsh';
 }
 
-function buildPromptCommand(kind, command, prompt) {
-  const normalizedPrompt = String(prompt ?? '').trim();
+function buildPromptCommand(_kind, command, _prompt) {
+  const normalizedPrompt = String(_prompt ?? '').trim();
   if (!normalizedPrompt) {
     return command;
   }
-  if (kind === 'codex') {
+  if (_kind === 'codex') {
     return `${command} ${shellQuote(normalizedPrompt)}`;
   }
   return command;
+}
+
+function deriveInitialLastInput({ prompt }) {
+  const promptText = String(prompt || '').trim();
+  if (promptText) {
+    return promptText;
+  }
+  return '';
 }
 
 function normalizeTmuxSize(value) {
@@ -157,6 +181,15 @@ function normalizeTmuxSize(value) {
     return null;
   }
   return String(parsed);
+}
+
+async function tmuxSessionExists(project, tmuxName) {
+  try {
+    await runTmuxForProject(project, ['has-session', '-t', tmuxName], project.path);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function listSessions() {
@@ -216,14 +249,17 @@ export async function refreshSessions(projectLookup, projects = []) {
 
       const existing = sessions.find((session) => session.tmuxName === tmuxName && (session.sshHost || null) === item.sshHost);
       const startedAt = createdRaw ? new Date(Number(createdRaw) * 1000).toISOString() : new Date().toISOString();
+      const inferredCommand = existing?.command || (parsed.kind === 'tmux' ? process.env.SHELL || 'zsh' : parsed.kind);
       next.push({
         id: sessionIdFrom(item.sshHost, tmuxName),
         projectId: parsed.projectId,
         projectName: project.name,
         kind: parsed.kind,
-        command: existing?.command || (parsed.kind === 'tmux' ? process.env.SHELL || 'zsh' : parsed.kind),
+        command: inferredCommand,
         tmuxName,
         sshHost: item.sshHost || null,
+        workspacePath: existing?.workspacePath || project.path,
+        workspaceName: existing?.workspaceName || 'main',
         lastInput: existing?.lastInput || '',
         startedAt: existing?.startedAt || startedAt
       });
@@ -235,25 +271,37 @@ export async function refreshSessions(projectLookup, projects = []) {
   return sessions;
 }
 
-export async function spawnSession({ project, kind, rawCommand, prompt }) {
-  const baseCommand = buildCommand(kind, rawCommand, project.path);
+export async function spawnSession({ project, kind, rawCommand, prompt, workspacePath, workspaceName }) {
+  const sessionPath = String(workspacePath || project.path || '').trim() || project.path;
+  const sessionWorkspaceName = String(workspaceName || 'main').trim() || 'main';
+  const baseCommand = buildCommand(kind, rawCommand, sessionPath, Boolean(project.sshHost));
   const command = buildPromptCommand(kind, baseCommand, prompt);
+  const promptInjectedInCommand = command !== baseCommand;
+  const normalizedPrompt = String(prompt ?? '').trim();
+  const initialLastInput = deriveInitialLastInput({ prompt });
   const tmuxName = `${project.id}-${kind}-${nanoid(5)}`;
   const tmuxWidth = normalizeTmuxSize(process.env.TMUX_COLS);
   const tmuxHeight = normalizeTmuxSize(process.env.TMUX_ROWS);
   if (AGENT_KINDS.has(kind)) {
-    const available = await commandExists(command, project);
-    if (!available) {
-      const error = new Error(
-        `${kind} is not installed. Download/install ${kind} and ensure it is on PATH, then retry.`
-      );
-      error.code = 'MISSING_CLI';
-      error.kind = kind;
-      throw error;
+    // Remote sessions skip preflight command existence checks to avoid an extra
+    // SSH round trip and reduce launch latency.
+    if (!project.sshHost) {
+      const available = await commandExists(command, { ...project, path: sessionPath });
+      if (!available) {
+        const error = new Error(
+          `${kind} is not installed. Download/install ${kind} and ensure it is on PATH, then retry.`
+        );
+        error.code = 'MISSING_CLI';
+        error.kind = kind;
+        throw error;
+      }
     }
   }
 
   try {
+    if (AGENT_KINDS.has(kind) && !project.sshHost) {
+      await ensureSessionRulesFiles(sessionPath);
+    }
     const newSessionArgs = ['new-session', '-d', '-s', tmuxName];
     if (tmuxWidth) {
       newSessionArgs.push('-x', tmuxWidth);
@@ -261,15 +309,27 @@ export async function spawnSession({ project, kind, rawCommand, prompt }) {
     if (tmuxHeight) {
       newSessionArgs.push('-y', tmuxHeight);
     }
+    // For remote agent sessions, launch from the user's login shell so agent
+    // auth/env exports are available (Codex can stall without full login env).
     const tmuxCommand = project.sshHost && AGENT_KINDS.has(kind)
-      ? `"$SHELL" -lic ${shellQuote(command)}`
+      ? `"$SHELL" -lic ${shellQuote(`exec ${command}`)}`
       : command;
-    newSessionArgs.push('-c', project.path, tmuxCommand);
-    await runTmuxForProject(project, newSessionArgs, project.path);
+    newSessionArgs.push('-c', sessionPath, tmuxCommand);
+    await runTmuxForProject(project, newSessionArgs, sessionPath);
     try {
+      // Reinforce global tmux history depth in case user config overrides it low.
+      await runTmuxForProject(project, ['set-window-option', '-g', 'history-limit', TMUX_HISTORY_LIMIT_LINES], sessionPath);
       // Apply mouse mode after server/session creation so first launch works on hosts
       // where no tmux socket exists yet.
-      await runTmuxForProject(project, ['set-option', '-t', tmuxName, 'mouse', 'off'], project.path);
+      await runTmuxForProject(project, ['set-option', '-t', tmuxName, 'mouse', 'off'], sessionPath);
+      // Hide the tmux status bar in embedded terminals to avoid bright bottom bars.
+      await runTmuxForProject(project, ['set-option', '-t', tmuxName, 'status', 'off'], sessionPath);
+      await runTmuxForProject(project, ['set-window-option', '-t', tmuxName, 'history-limit', TMUX_HISTORY_LIMIT_LINES], sessionPath);
+      if (AGENT_KINDS.has(kind)) {
+        // Keep full-screen agent UIs in the main pane history so browser scrollback
+        // can reveal prior output instead of a short alternate-screen buffer.
+        await runTmuxForProject(project, ['set-window-option', '-t', tmuxName, 'alternate-screen', 'off'], sessionPath);
+      }
     } catch {
       // Ignore optional tmux UI setting failures.
     }
@@ -284,7 +344,30 @@ export async function spawnSession({ project, kind, rawCommand, prompt }) {
       if (tmuxHeight) {
         resizeArgs.push('-y', tmuxHeight);
       }
-      await runTmuxForProject(project, resizeArgs, project.path);
+      await runTmuxForProject(project, resizeArgs, sessionPath);
+    }
+
+    if (AGENT_KINDS.has(kind) && normalizedPrompt && !promptInjectedInCommand) {
+      try {
+        await runTmuxForProject(project, ['send-keys', '-t', tmuxName, '-l', normalizedPrompt], sessionPath);
+        await runTmuxForProject(project, ['send-keys', '-t', tmuxName, 'C-m'], sessionPath);
+      } catch {
+        // Ignore prompt preload failures; session is already running.
+      }
+    }
+
+    if (AGENT_KINDS.has(kind)) {
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      const alive = await tmuxSessionExists(project, tmuxName);
+      if (!alive) {
+        const where = project.sshHost ? `${project.sshHost}:${project.path}` : project.path;
+        const error = new Error(
+          `${kind} exited immediately after launch in ${where}. Run "${kind}" manually in that directory and fix the remote agent install/auth/environment.`
+        );
+        error.code = 'AGENT_EXITED_EARLY';
+        error.kind = kind;
+        throw error;
+      }
     }
   } catch (error) {
     await trackAlert('session.launch_failed', {
@@ -305,7 +388,9 @@ export async function spawnSession({ project, kind, rawCommand, prompt }) {
     command,
     tmuxName,
     sshHost: project.sshHost || null,
-    lastInput: '',
+    workspacePath: sessionPath,
+    workspaceName: sessionWorkspaceName,
+    lastInput: initialLastInput,
     startedAt: new Date().toISOString()
   };
   sessions.unshift(session);
@@ -316,6 +401,8 @@ export async function spawnSession({ project, kind, rawCommand, prompt }) {
     kind,
     tmuxName,
     command,
+    workspacePath: sessionPath,
+    workspaceName: sessionWorkspaceName,
     sshHost: project.sshHost || null
   });
 

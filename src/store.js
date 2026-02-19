@@ -3,8 +3,9 @@ import path from 'node:path';
 import { nanoid } from 'nanoid';
 import {
   CONFIG_PATH,
-  DEFAULT_MCP_CATALOG,
+  DEFAULT_MCP_REPO,
   DEFAULT_MCP_REPOSITORIES,
+  DEFAULT_MEMORY_SETTINGS,
   DEFAULT_PROXY_TARGETS,
   EVENT_LOG_PATH,
   APROPOS_HOME,
@@ -15,15 +16,54 @@ const DEFAULT_STATE = {
   settings: {
     mcpRepositoryBase: '',
     mcpRepositories: DEFAULT_MCP_REPOSITORIES,
-    proxyTargets: DEFAULT_PROXY_TARGETS
+    proxyTargets: DEFAULT_PROXY_TARGETS,
+    memory: DEFAULT_MEMORY_SETTINGS
   },
   projects: [],
   projectFolders: [],
   projectFolderByProject: {},
-  activeFolderId: null
+  activeFolderId: null,
+  sessionTileSizesByProject: {}
 };
 
 let state = structuredClone(DEFAULT_STATE);
+
+function normalizeSessionTileSizesByProject(input, validProjectIds = new Set()) {
+  const source = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
+  const result = {};
+  for (const [projectIdRaw, entriesRaw] of Object.entries(source)) {
+    const projectId = String(projectIdRaw || '').trim();
+    if (!projectId) {
+      continue;
+    }
+    if (validProjectIds.size && !validProjectIds.has(projectId)) {
+      continue;
+    }
+    if (!entriesRaw || typeof entriesRaw !== 'object' || Array.isArray(entriesRaw)) {
+      continue;
+    }
+    const cleanedEntries = {};
+    for (const [keyRaw, sizeRaw] of Object.entries(entriesRaw)) {
+      const key = String(keyRaw || '').trim();
+      if (!key) {
+        continue;
+      }
+      const width = Number(sizeRaw?.width);
+      const height = Number(sizeRaw?.height);
+      if (!Number.isFinite(width) || !Number.isFinite(height)) {
+        continue;
+      }
+      cleanedEntries[key] = {
+        width: Math.max(1, Math.min(6, Math.round(width))),
+        height: Math.max(1, Math.min(6, Math.round(height)))
+      };
+    }
+    if (Object.keys(cleanedEntries).length) {
+      result[projectId] = cleanedEntries;
+    }
+  }
+  return result;
+}
 
 function normalizeMcpTool(item) {
   const id = String(item?.id || '').trim();
@@ -60,11 +100,48 @@ function normalizeMcpRepository(item) {
 
 function normalizeMcpRepositories(input) {
   const list = Array.isArray(input) ? input : DEFAULT_MCP_REPOSITORIES;
-  const normalized = list.map((item) => normalizeMcpRepository(item)).filter(Boolean);
-  if (normalized.length) {
-    return normalized;
-  }
-  return structuredClone(DEFAULT_MCP_REPOSITORIES);
+  const normalized = list
+    .map((item) => normalizeMcpRepository(item))
+    .filter((item) => item && String(item.gitUrl || '').trim() !== DEFAULT_MCP_REPO);
+  return normalized;
+}
+
+function normalizeMemorySettings(input) {
+  const base = DEFAULT_MEMORY_SETTINGS;
+  const source = input && typeof input === 'object' && !Array.isArray(input) ? input : {};
+  const vectorSource = source.vectorStore && typeof source.vectorStore === 'object' && !Array.isArray(source.vectorStore)
+    ? source.vectorStore
+    : {};
+  const providerRaw = String(vectorSource.provider || base.vectorStore.provider || 'local').trim().toLowerCase();
+  const provider = ['local', 'qdrant'].includes(providerRaw) ? providerRaw : 'local';
+  const dockerPort = Number.parseInt(String(vectorSource.dockerPort ?? base.vectorStore.dockerPort), 10);
+  return {
+    autoCaptureMcp: source.autoCaptureMcp !== false,
+    vectorStore: {
+      ...base.vectorStore,
+      ...vectorSource,
+      provider,
+      endpoint: String(vectorSource.endpoint ?? base.vectorStore.endpoint ?? '').trim(),
+      collection: String(vectorSource.collection ?? base.vectorStore.collection ?? 'apropos_memory').trim() || 'apropos_memory',
+      autoStartOnboarding: vectorSource.autoStartOnboarding !== false,
+      dockerContainer: String(vectorSource.dockerContainer ?? base.vectorStore.dockerContainer ?? 'apropos-qdrant').trim() || 'apropos-qdrant',
+      dockerImage: String(vectorSource.dockerImage ?? base.vectorStore.dockerImage ?? 'qdrant/qdrant:latest').trim() || 'qdrant/qdrant:latest',
+      dockerPort: Number.isFinite(dockerPort) && dockerPort > 0 ? dockerPort : base.vectorStore.dockerPort
+    }
+  };
+}
+
+function normalizeProject(rawProject) {
+  const { isGit: _legacyIsGit, ...project } = rawProject || {};
+  const repositories = Array.isArray(rawProject?.mcpRepositories)
+    ? normalizeMcpRepositories(rawProject.mcpRepositories)
+    : [];
+  return {
+    ...project,
+    mcpRepositories: repositories,
+    mcpTools: Array.isArray(rawProject?.mcpTools) ? rawProject.mcpTools : [],
+    skills: Array.isArray(rawProject?.skills) ? rawProject.skills : []
+  };
 }
 
 export async function ensureHome() {
@@ -90,9 +167,12 @@ export async function loadState() {
         proxyTargets: {
           ...DEFAULT_PROXY_TARGETS,
           ...(parsed.settings?.proxyTargets || {})
-        }
+        },
+        memory: normalizeMemorySettings(parsed.settings?.memory)
       },
-      projects: Array.isArray(parsed.projects) ? parsed.projects : [],
+      projects: Array.isArray(parsed.projects)
+        ? parsed.projects.map((project) => normalizeProject(project))
+        : [],
       projectFolders: Array.isArray(parsed.projectFolders)
         ? parsed.projectFolders
           .map((item) => ({
@@ -110,6 +190,8 @@ export async function loadState() {
         : {},
       activeFolderId: parsed.activeFolderId ? String(parsed.activeFolderId).trim() : null
     };
+    const projectIds = new Set((state.projects || []).map((item) => item.id));
+    state.sessionTileSizesByProject = normalizeSessionTileSizesByProject(parsed.sessionTileSizesByProject, projectIds);
   } catch (error) {
     if (error.code !== 'ENOENT') {
       throw error;
@@ -153,12 +235,20 @@ export async function updateFolderState(nextState) {
   };
 }
 
+export async function updateSessionTileSizes(sessionTileSizesByProject) {
+  const projectIds = new Set((state.projects || []).map((item) => item.id));
+  state.sessionTileSizesByProject = normalizeSessionTileSizesByProject(sessionTileSizesByProject, projectIds);
+  await persistState();
+  return state.sessionTileSizesByProject;
+}
+
 export async function persistState() {
   await ensureHome();
   await fs.writeFile(CONFIG_PATH, JSON.stringify(state, null, 2) + '\n', 'utf8');
 }
 
-export function sanitizeProject(project) {
+export function sanitizeProject(project, overrides = {}) {
+  const isGit = typeof overrides.isGit === 'boolean' ? overrides.isGit : Boolean(project.isGit);
   return {
     id: project.id,
     name: project.name,
@@ -166,9 +256,10 @@ export function sanitizeProject(project) {
     sshHost: project.sshHost || null,
     isRemote: Boolean(project.sshHost),
     color: project.color,
-    isGit: project.isGit,
+    isGit,
     docsDir: path.join(project.path, 'docs'),
     agentsSymlinkOk: project.agentsSymlinkOk,
+    mcpRepositories: normalizeMcpRepositories(project.mcpRepositories),
     mcpTools: project.mcpTools || [],
     skills: project.skills || [],
     createdAt: project.createdAt,
@@ -176,7 +267,7 @@ export function sanitizeProject(project) {
   };
 }
 
-export async function addProject({ name, projectPath, isGit, sshHost = null }) {
+export async function addProject({ name, projectPath, sshHost = null }) {
   const color = PROJECT_COLORS[state.projects.length % PROJECT_COLORS.length];
   const now = new Date().toISOString();
   const project = {
@@ -184,8 +275,8 @@ export async function addProject({ name, projectPath, isGit, sshHost = null }) {
     name,
     path: projectPath,
     sshHost: sshHost || null,
-    isGit: Boolean(isGit),
     color,
+    mcpRepositories: [],
     mcpTools: [],
     skills: [],
     agentsSymlinkOk: false,
@@ -204,7 +295,8 @@ export async function updateSettings(updateFn) {
     proxyTargets: {
       ...DEFAULT_PROXY_TARGETS,
       ...(state.settings?.proxyTargets || {})
-    }
+    },
+    memory: normalizeMemorySettings(state.settings?.memory)
   };
   const next = typeof updateFn === 'function' ? updateFn(base) || base : base;
   state.settings = {
@@ -214,7 +306,8 @@ export async function updateSettings(updateFn) {
     proxyTargets: {
       ...DEFAULT_PROXY_TARGETS,
       ...(next?.proxyTargets || {})
-    }
+    },
+    memory: normalizeMemorySettings(next?.memory)
   };
   await persistState();
   return state.settings;
@@ -241,30 +334,30 @@ export async function removeProject(projectId) {
     return null;
   }
   const [removed] = state.projects.splice(index, 1);
+  if (state.sessionTileSizesByProject && typeof state.sessionTileSizesByProject === 'object') {
+    delete state.sessionTileSizesByProject[projectId];
+  }
   await persistState();
   return removed;
 }
 
 export function getMcpCatalog() {
   const byId = new Map();
-  const repositories = normalizeMcpRepositories(state.settings?.mcpRepositories);
-  for (const repository of repositories) {
-    for (const tool of repository.tools || []) {
-      const normalized = normalizeMcpTool({
-        ...tool,
-        repo: tool?.repo || repository.gitUrl
-      });
-      if (!normalized) {
-        continue;
+  for (const project of state.projects || []) {
+    const repositories = normalizeMcpRepositories(project?.mcpRepositories);
+    for (const repository of repositories) {
+      for (const tool of repository.tools || []) {
+        const normalized = normalizeMcpTool({
+          ...tool,
+          repo: tool?.repo || repository.gitUrl
+        });
+        if (!normalized) {
+          continue;
+        }
+        if (!byId.has(normalized.id)) {
+          byId.set(normalized.id, normalized);
+        }
       }
-      if (!byId.has(normalized.id)) {
-        byId.set(normalized.id, normalized);
-      }
-    }
-  }
-  if (!byId.size) {
-    for (const tool of DEFAULT_MCP_CATALOG) {
-      byId.set(tool.id, tool);
     }
   }
   return [...byId.values()];

@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { agentSystemsWithAgentsFile, agentsFilePath, skillDirPath } from './agent-systems.js';
 
 export async function ensureProjectLayout(projectPath) {
   await fs.mkdir(projectPath, { recursive: true });
@@ -36,6 +37,27 @@ export async function ensureProjectLayout(projectPath) {
       agentsSymlinkOk = false;
     }
   }
+
+  // Ensure Cursor (and any other agent system) context files and dirs exist.
+  for (const system of agentSystemsWithAgentsFile()) {
+    if (system.id === 'claude') {
+      continue; // already handled above
+    }
+    const filePath = agentsFilePath(projectPath, system.id, false);
+    if (!filePath) {
+      continue;
+    }
+    try {
+      await fs.access(filePath);
+    } catch {
+      const content = system.agentsFile?.defaultContent ?? '';
+      await fs.writeFile(filePath, content, 'utf8');
+    }
+  }
+
+  // Ensure Cursor rules dir exists (and any other system skill dirs for consistency).
+  const cursorRulesDir = skillDirPath(projectPath, 'cursor', false);
+  await fs.mkdir(cursorRulesDir, { recursive: true });
 
   return {
     docsDir: path.join(projectPath, 'docs'),

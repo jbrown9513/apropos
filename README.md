@@ -6,15 +6,17 @@ Local dashboard + MCP observability proxy for project operations.
 
 - Registers local projects (git and non-git).
 - Registers remote projects over SSH (`host:path`) with the same workspace/session controls.
+- Supports git worktree-aware session launch for git projects (main, existing worktree, or create new), including remote hosts.
 - Stores config in `$APROPOS_HOME` (default: `~/.apropos`).
 - Scaffolds each project with:
   - `docs/`
   - `CLAUDE.md`
   - `AGENTS.md -> CLAUDE.md` symlink
-- Adds project MCP tools from a default catalog based on `modelcontextprotocol/servers`.
-- Supports additional MCP catalogs from git repositories (configured in-app).
+- Adds project MCP tools from project-scoped MCP repositories.
+- Supports additional MCP catalogs from git repositories (configured per project in-app).
   - Custom MCP repositories should be set with a GitHub SSH URL that has push access (for example `git@github.com:org/repo.git`).
-  - Repositories are cloned under `$APROPOS_HOME/mcp/<repo-id>` (default root: `~/.apropos/mcp`).
+  - Repositories are cloned under `$APROPOS_HOME/<project-id>/mcp/<repo-id>` (default root: `~/.apropos/<project-id>/mcp/<repo-id>`).
+  - MCP configuration also supports a local-project mode that launches the setup skill to discover and wire an existing local MCP server without requiring a GitHub URL.
 - Writes project-specific MCP config files for both:
   - Claude Code: `.mcp.json`
   - Codex: `.codex/config.toml`
@@ -37,6 +39,10 @@ By default, new `tmux` sessions use tmux/client-managed sizing so they can expan
 - Supports reusable project automations in `.automations/*.json` (run from the workspace "Run Automation" button).
 - Exposes an MCP proxy endpoint with event + alert logging.
 - Streams MCP proxy interaction logs in the workspace `LOGS` panel.
+- Supports optional VCS command mapping config for code-session rules:
+  - Global: `~/.apropos/plugins/vcs-mappings.json`
+  - Plugin repos: any `vcs-mappings.json` inside `~/.apropos/plugins/**`
+  - Project override: `<project>/.apropos/vcs-mappings.json`
 
 ## Automations
 
@@ -81,10 +87,15 @@ Open `http://localhost:4311`.
 - `GET /api/dashboard`
 - `POST /api/projects`
 - `POST /api/projects/:projectId/scaffold`
+- `GET /api/projects/:projectId/worktrees`
+- `POST /api/projects/:projectId/worktrees`
 - `POST /api/projects/:projectId/mcp-tools`
 - `POST /api/projects/:projectId/mcp-tools/setup`
-- `POST /api/mcp/repositories`
-- `POST /api/mcp/repositories/:repoId/sync`
+- `POST /api/projects/:projectId/mcp-tools/draft-server-session`
+- `GET /api/projects/:projectId/mcp/repositories`
+- `POST /api/projects/:projectId/mcp/repositories`
+- `POST /api/projects/:projectId/mcp/repositories/:repoId/sync`
+- `POST /api/workspace/session-sizes`
 - `POST /api/projects/:projectId/skills`
 - `POST /api/projects/:projectId/sessions`
 - `DELETE /api/sessions/:sessionId`

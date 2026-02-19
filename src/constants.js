@@ -45,17 +45,26 @@ export const DEFAULT_MCP_CATALOG = [
 ];
 
 export const DEFAULT_MCP_REPOSITORIES = [
-  {
-    id: 'modelcontextprotocol-servers',
-    name: 'Model Context Protocol Servers',
-    gitUrl: DEFAULT_MCP_REPO,
-    tools: DEFAULT_MCP_CATALOG
-  }
+  // Intentionally empty. Repositories are user-configured.
 ];
 
 export const DEFAULT_PROXY_TARGETS = {
   codex: process.env.CODEX_MCP_URL || 'http://127.0.0.1:4312/mcp',
-  claude: process.env.CLAUDE_MCP_URL || 'http://127.0.0.1:4313/mcp'
+  claude: process.env.CLAUDE_MCP_URL || 'http://127.0.0.1:4313/mcp',
+  cursor: process.env.CURSOR_MCP_URL || 'http://127.0.0.1:4314/mcp'
+};
+
+export const DEFAULT_MEMORY_SETTINGS = {
+  autoCaptureMcp: true,
+  vectorStore: {
+    provider: 'local',
+    endpoint: '',
+    collection: 'apropos_memory',
+    autoStartOnboarding: true,
+    dockerContainer: 'apropos-qdrant',
+    dockerImage: 'qdrant/qdrant:latest',
+    dockerPort: 6333
+  }
 };
 
 export const PROJECT_COLORS = [

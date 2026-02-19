@@ -13,6 +13,6 @@ Use this skill when a user wants an MCP configured in this project with Apropos 
 - `.mcp.json` for Claude
 - `.codex/config.toml` for Codex
 2. Route MCP interactions through:
-- `http://127.0.0.1:4311/api/proxy/codex`
-- `http://127.0.0.1:4311/api/proxy/claude`
+- `http://127.0.0.1:4311/api/projects/<project-id>/proxy/codex`
+- `http://127.0.0.1:4311/api/projects/<project-id>/proxy/claude`
 3. Verify basic connectivity and report changes.

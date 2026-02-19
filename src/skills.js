@@ -1,5 +1,12 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import {
+  AGENT_SYSTEM_IDS,
+  getAgentSystem,
+  isValidSkillTarget,
+  skillFilePath,
+  skillDirPath
+} from './agent-systems.js';
 
 function slugify(name) {
   return name
@@ -28,36 +35,48 @@ function ensureSkillFrontmatter(name, content) {
   ].join('\n');
 }
 
+/**
+ * Write a skill/rule for a single agent system. Cursor uses plain markdown in .cursor/rules/<slug>.md;
+ * frontmatter is optional but we keep it for consistency.
+ */
 export async function writeSkill(projectPath, { name, content, target }) {
   const normalizedTarget = String(target || '').trim().toLowerCase();
-  if (!['codex', 'claude'].includes(normalizedTarget)) {
-    throw new Error('Skill target must be codex or claude');
+  if (!isValidSkillTarget(normalizedTarget)) {
+    throw new Error(`Skill target must be one of: ${AGENT_SYSTEM_IDS.join(', ')}`);
   }
   const slug = slugify(name);
+  const system = getAgentSystem(normalizedTarget);
   const normalizedContent = ensureSkillFrontmatter(name, content);
   const written = [];
   const removed = [];
-  const codexSkillDir = path.join(projectPath, '.codex', 'skills', slug);
-  const claudeSkillDir = path.join(projectPath, '.claude', 'skills', slug);
 
-  if (normalizedTarget === 'codex') {
-    await fs.mkdir(codexSkillDir, { recursive: true });
-    const codexFile = path.join(codexSkillDir, 'SKILL.md');
-    await fs.writeFile(codexFile, normalizedContent, 'utf8');
-    written.push(codexFile);
-  } else {
-    await fs.rm(codexSkillDir, { recursive: true, force: true });
-    removed.push(codexSkillDir);
-  }
-
-  if (normalizedTarget === 'claude') {
-    await fs.mkdir(claudeSkillDir, { recursive: true });
-    const claudeFile = path.join(claudeSkillDir, 'SKILL.md');
-    await fs.writeFile(claudeFile, normalizedContent, 'utf8');
-    written.push(claudeFile);
-  } else {
-    await fs.rm(claudeSkillDir, { recursive: true, force: true });
-    removed.push(claudeSkillDir);
+  for (const systemId of AGENT_SYSTEM_IDS) {
+    const filePath = skillFilePath(projectPath, systemId, slug, false);
+    if (!filePath) {
+      continue;
+    }
+    if (systemId === normalizedTarget) {
+      const dir = skillDirPath(projectPath, systemId, false);
+      if (system.skills.layout === 'subdir') {
+        await fs.mkdir(path.dirname(filePath), { recursive: true });
+      } else {
+        await fs.mkdir(dir, { recursive: true });
+      }
+      await fs.writeFile(filePath, normalizedContent, 'utf8');
+      written.push(filePath);
+    } else {
+      try {
+        if (getAgentSystem(systemId).skills.layout === 'subdir') {
+          await fs.rm(path.dirname(filePath), { recursive: true, force: true });
+          removed.push(path.dirname(filePath));
+        } else {
+          await fs.rm(filePath, { force: true });
+          removed.push(filePath);
+        }
+      } catch {
+        // ignore missing
+      }
+    }
   }
 
   return { slug, written, removed };

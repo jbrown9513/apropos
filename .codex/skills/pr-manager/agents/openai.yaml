@@ -1,0 +1,4 @@
+interface:
+  display_name: "PR Manager"
+  short_description: "Review local changes, draft PRs, and publish with GitHub CLI."
+  default_prompt: "Inspect git changes, build a concise PR summary, and publish the pull request with gh."

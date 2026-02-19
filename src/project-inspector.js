@@ -1,5 +1,6 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { AGENT_SYSTEM_IDS, skillDirPath } from './agent-systems.js';
 
 function unique(items) {
   return [...new Set(items)];
@@ -37,6 +38,18 @@ async function listDirectories(dirPath) {
   try {
     const entries = await fs.readdir(dirPath, { withFileTypes: true });
     return entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name);
+  } catch {
+    return [];
+  }
+}
+
+/** List .md file basenames without extension in a dir (for Cursor flat rules). */
+async function listRuleSlugsInDir(dirPath) {
+  try {
+    const entries = await fs.readdir(dirPath, { withFileTypes: true });
+    return entries
+      .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith('.md'))
+      .map((entry) => entry.name.slice(0, -3));
   } catch {
     return [];
   }
@@ -130,6 +143,12 @@ export async function inspectProjectConfiguration(project, catalog) {
     discoveredMcpIds.push(...parseTomlMcpIds(codexConfigRaw));
   }
 
+  const cursorConfigPath = path.join(projectPath, '.cursor', 'mcp.json');
+  const cursorConfig = await readJson(cursorConfigPath);
+  if (cursorConfig?.mcpServers && typeof cursorConfig.mcpServers === 'object') {
+    discoveredMcpIds.push(...Object.keys(cursorConfig.mcpServers));
+  }
+
   const storedMcpIds = (project.mcpTools || []).map((tool) => tool.id);
   const mcpIds = unique([...storedMcpIds, ...discoveredMcpIds]);
   const mcpTools = mcpIds.map((toolId) => {
@@ -150,19 +169,33 @@ export async function inspectProjectConfiguration(project, catalog) {
     };
   });
 
-  const codexSkills = await listDirectories(path.join(projectPath, '.codex', 'skills'));
-  const claudeSkills = await listDirectories(path.join(projectPath, '.claude', 'skills'));
+  const skillsBySystem = {};
+  skillsBySystem.codex = await listDirectories(path.join(projectPath, '.codex', 'skills'));
+  skillsBySystem.claude = await listDirectories(path.join(projectPath, '.claude', 'skills'));
+  skillsBySystem.cursor = await listRuleSlugsInDir(skillDirPath(projectPath, 'cursor', false));
+
   const storedSkills = project.skills || [];
   const storedById = new Map(storedSkills.map((item) => [item.id, item]));
-  const discoveredSkillIds = unique([...storedSkills.map((item) => item.id), ...codexSkills, ...claudeSkills]);
+  const allDiscovered = [
+    ...skillsBySystem.codex,
+    ...skillsBySystem.claude,
+    ...skillsBySystem.cursor
+  ];
+  const discoveredSkillIds = unique([...storedSkills.map((item) => item.id), ...allDiscovered]);
 
   const skills = discoveredSkillIds.map((skillId) => {
-    const codexHas = codexSkills.includes(skillId);
-    const inferredTarget = codexHas ? 'codex' : 'claude';
+    let inferredTarget = 'codex';
+    if (skillsBySystem.codex.includes(skillId)) {
+      inferredTarget = 'codex';
+    } else if (skillsBySystem.claude.includes(skillId)) {
+      inferredTarget = 'claude';
+    } else if (skillsBySystem.cursor.includes(skillId)) {
+      inferredTarget = 'cursor';
+    }
     const stored = storedById.get(skillId);
     if (stored) {
       const storedTarget = String(stored.target || '').trim().toLowerCase();
-      const normalizedTarget = ['codex', 'claude'].includes(storedTarget) ? storedTarget : inferredTarget;
+      const normalizedTarget = AGENT_SYSTEM_IDS.includes(storedTarget) ? storedTarget : inferredTarget;
       return {
         ...stored,
         target: normalizedTarget
@@ -179,6 +212,15 @@ export async function inspectProjectConfiguration(project, catalog) {
   const { exists: docsExists, entries: docsEntries } = await listDocEntries(projectPath);
   const agents = await inspectAgents(projectPath);
 
+  const cursorRulesPath = path.join(projectPath, '.cursorrules');
+  let cursorAgentsExists = false;
+  try {
+    await fs.access(cursorRulesPath);
+    cursorAgentsExists = true;
+  } catch {
+    // .cursorrules not present
+  }
+
   return {
     mcpTools,
     skills,
@@ -186,7 +228,8 @@ export async function inspectProjectConfiguration(project, catalog) {
       docsDir: path.join(projectPath, 'docs'),
       docsExists,
       docsEntries,
-      agents
+      agents,
+      cursorAgents: { exists: cursorAgentsExists }
     }
   };
 }

@@ -56,6 +56,23 @@ export function dismissAlert(alertId) {
   return true;
 }
 
+export function dismissAlertsForProject(projectId) {
+  const normalized = String(projectId || '').trim();
+  if (!normalized) {
+    return 0;
+  }
+  let removedCount = 0;
+  for (let index = alerts.length - 1; index >= 0; index -= 1) {
+    const alert = alerts[index];
+    if (String(alert?.payload?.projectId || '').trim() !== normalized) {
+      continue;
+    }
+    alerts.splice(index, 1);
+    removedCount += 1;
+  }
+  return removedCount;
+}
+
 export function clearAlerts() {
   const count = alerts.length;
   alerts.length = 0;

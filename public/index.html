@@ -9,34 +9,104 @@
     <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-attach@0.11.0/lib/addon-attach.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-web-links@0.11.0/lib/addon-web-links.min.js"></script>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
+    <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@500;600&family=Space+Grotesk:wght@400;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
     <div class="noise"></div>
     <div class="notification-shell">
       <div class="notification-toolbar" aria-label="Project toolbar">
-        <label class="project-switcher" data-project-switcher hidden>
-          <span class="sr-only">Active project</span>
-          <select id="projectSwitcher" aria-label="Active project"></select>
-        </label>
         <button
-          id="notificationToggle"
-          class="notification-toggle"
+          id="mobileContextToggle"
+          class="mobile-context-toggle"
           type="button"
-          aria-label="Notifications"
+          aria-label="Open project menu"
           aria-haspopup="true"
           aria-expanded="false"
-          aria-controls="notificationCenter"
         >
-          <svg class="notification-icon" viewBox="0 0 24 24" aria-hidden="true">
-            <path d="M12 22a2.5 2.5 0 0 0 2.4-2h-4.8a2.5 2.5 0 0 0 2.4 2Zm7-5H5v-1.3l1.4-1.4V10a5.6 5.6 0 1 1 11.2 0v4.3l1.4 1.4V17Z" />
+          <svg class="mobile-context-icon lucide" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M4 6h16"></path>
+            <path d="M4 12h16"></path>
+            <path d="M4 18h16"></path>
           </svg>
-          <span class="sr-only">Notifications</span>
-          <span id="notificationBadge" class="notification-badge" hidden>0</span>
+          <span id="mobileContextBadge" class="mobile-context-badge" hidden>0</span>
         </button>
+        <div class="notification-toolbar-content" data-context-content>
+          <div class="project-switcher" data-project-switcher hidden>
+            <button
+              id="projectSwitcherTrigger"
+              class="project-switcher-trigger"
+              type="button"
+              aria-haspopup="listbox"
+              aria-expanded="false"
+              aria-controls="projectSwitcherMenu"
+            ></button>
+            <div id="projectSwitcherMenu" class="project-switcher-menu" role="listbox" hidden></div>
+          </div>
+          <button
+            id="themeToggle"
+            class="theme-toggle"
+            type="button"
+            aria-label="Switch to light theme"
+            title="Toggle theme"
+          >
+            <span class="theme-icon" aria-hidden="true">
+              <svg class="lucide theme-icon-svg" viewBox="0 0 24 24" aria-hidden="true">
+                <circle cx="12" cy="12" r="4"></circle>
+                <path d="M12 2v2"></path>
+                <path d="M12 20v2"></path>
+                <path d="m4.93 4.93 1.41 1.41"></path>
+                <path d="m17.66 17.66 1.41 1.41"></path>
+                <path d="M2 12h2"></path>
+                <path d="M20 12h2"></path>
+                <path d="m6.34 17.66-1.41 1.41"></path>
+                <path d="m19.07 4.93-1.41 1.41"></path>
+              </svg>
+            </span>
+            <span class="theme-track" aria-hidden="true">
+              <span class="theme-thumb"></span>
+            </span>
+            <span class="theme-icon" aria-hidden="true">
+              <svg class="lucide theme-icon-svg" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9"></path>
+              </svg>
+            </span>
+          </button>
+          <label class="focus-toggle" for="rouletteModeToggle" title="Focus mode">
+            <span class="focus-icon" aria-hidden="true">
+              <svg class="lucide focus-icon-svg" viewBox="0 0 24 24" aria-hidden="true">
+                <circle cx="12" cy="12" r="3"></circle>
+                <path d="M3 12h3"></path>
+                <path d="M18 12h3"></path>
+                <path d="M12 3v3"></path>
+                <path d="M12 18v3"></path>
+                <circle cx="12" cy="12" r="8"></circle>
+              </svg>
+            </span>
+            <input id="rouletteModeToggle" type="checkbox" />
+            <span class="focus-slider" aria-hidden="true"></span>
+            <span class="sr-only">Toggle focus mode</span>
+          </label>
+          <button
+            id="notificationToggle"
+            class="notification-toggle"
+            type="button"
+            aria-label="Notifications"
+            aria-haspopup="true"
+            aria-expanded="false"
+            aria-controls="notificationCenter"
+          >
+            <svg class="notification-icon lucide" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M10.268 21a2 2 0 0 0 3.464 0"></path>
+              <path d="M3.262 15.326A1 1 0 0 0 4 17h16a1 1 0 0 0 .74-1.673C19.41 13.956 18 12.499 18 8a6 6 0 0 0-12 0c0 4.499-1.411 5.956-2.738 7.326"></path>
+            </svg>
+            <span class="sr-only">Notifications</span>
+            <span id="notificationBadge" class="notification-badge" hidden>0</span>
+          </button>
+        </div>
       </div>
       <aside id="notificationCenter" class="notification-center" aria-live="polite" hidden>
         <div class="notification-head">
@@ -47,13 +117,14 @@
         <p id="notificationEmpty" class="mono notification-empty">No notifications.</p>
       </aside>
     </div>
-    <button id="addProjectFab" class="fab" title="Add project">+</button>
+    <button id="addProjectFab" class="fab" title="Add project" aria-label="Add project">
+      <svg class="lucide fab-icon" viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M5 12h14"></path>
+        <path d="M12 5v14"></path>
+      </svg>
+    </button>
     <header>
       <h1>apropos</h1>
-      <p>coders dream dashboard for project control, MCP visibility, and launcher ops</p>
-      <div class="main-actions">
-        <button id="mainMcpAddRepoBtn" class="small" type="button">Set MCP Repo URL</button>
-      </div>
       <div id="homePath"></div>
     </header>
 
@@ -98,8 +169,13 @@
         <button class="small" type="button" data-workspace-launch="tmux">+ tmux</button>
         <button class="small" type="button" data-workspace-launch="codex">+ codex</button>
         <button class="small" type="button" data-workspace-launch="claude">+ claude</button>
+        <button class="small" type="button" data-workspace-launch="cursor">+ cursor</button>
+        <button class="small" type="button" data-workspace-launch="opencode">+ opencode</button>
         <button class="small" type="button" data-workspace-action="run-automation">RUN</button>
-        <button class="small" type="button" data-workspace-action="mcp">MCP</button>
+        <details id="workspaceMcpDropdown" class="toolbar-dropdown">
+          <summary class="mcp-dropdown-trigger">MCP</summary>
+          <div id="workspaceMcpMenu" class="toolbar-dropdown-menu" role="menu" aria-label="MCP actions"></div>
+        </details>
         <button class="small" type="button" data-workspace-action="skills">SKILLS</button>
         <button class="small" type="button" data-workspace-action="agents">AGENTS</button>
         <button class="small" type="button" data-workspace-action="logs">LOGS</button>
@@ -107,7 +183,12 @@
       <section id="workspaceEditor" class="workspace-editor" hidden>
         <div class="workspace-editor-head">
           <h3 id="workspaceEditorTitle">Editor</h3>
-          <button class="small alt" type="button" data-editor-close>Close</button>
+          <button class="small alt icon-close-btn" type="button" data-editor-close aria-label="Close editor" title="Close editor">
+            <svg class="lucide close-icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M18 6 6 18"></path>
+              <path d="m6 6 12 12"></path>
+            </svg>
+          </button>
         </div>
         <div id="workspaceEditorMeta" class="workspace-editor-meta">
           <label data-editor-skill-select hidden>
@@ -123,16 +204,31 @@
             <select id="workspaceEditorDocsFile"></select>
           </label>
         </div>
+        <div data-editor-agents-system class="workspace-editor-agents-system" hidden>
+          <label for="workspaceEditorAgentsSystem">Context</label>
+          <select id="workspaceEditorAgentsSystem" aria-label="Agent context file">
+            <option value="claude">Claude (CLAUDE.md)</option>
+            <option value="cursor">Cursor (.cursorrules)</option>
+          </select>
+        </div>
         <textarea id="workspaceEditorInput" class="workspace-editor-input mono"></textarea>
         <div class="workspace-editor-actions">
           <button class="small" type="button" data-editor-save>Save</button>
-          <button class="small alt" type="button" data-editor-close>Cancel</button>
+          <button class="small alt" type="button" data-editor-close>Exit</button>
         </div>
       </section>
       <section id="workspaceLogs" class="workspace-logs" hidden>
         <div class="workspace-editor-head">
-          <h3>MCP Proxy Logs</h3>
-          <button class="small alt" type="button" data-logs-clear>Clear</button>
+          <h3>Activity Logs</h3>
+          <div class="workspace-logs-pane-actions">
+            <div class="workspace-logs-view-toggle" role="tablist" aria-label="Logs view">
+            <button class="small alt" type="button" data-logs-view="mcp" aria-pressed="true">Activity</button>
+              <button class="small alt" type="button" data-logs-view="diff" aria-pressed="false">Diff Logs</button>
+            </div>
+            <button class="small alt" type="button" data-logs-filter>Filter: all</button>
+            <button class="small alt" type="button" data-logs-refresh hidden>Refresh</button>
+            <button class="small alt" type="button" data-logs-clear>Clear</button>
+          </div>
         </div>
         <pre id="workspaceLogsOutput" class="workspace-logs-output mono"></pre>
       </section>
@@ -140,8 +236,14 @@
         <div id="terminalGridSplit" class="terminal-grid"></div>
         <section id="workspaceLogsPane" class="workspace-logs-pane">
           <div class="workspace-editor-head">
-            <h3>MCP Proxy Logs</h3>
+            <h3>Activity Logs</h3>
             <div class="workspace-logs-pane-actions">
+              <div class="workspace-logs-view-toggle" role="tablist" aria-label="Logs view">
+                <button class="small alt" type="button" data-logs-view="mcp" aria-pressed="true">Activity</button>
+                <button class="small alt" type="button" data-logs-view="diff" aria-pressed="false">Diff Logs</button>
+              </div>
+              <button class="small alt" type="button" data-logs-filter>Filter: all</button>
+              <button class="small alt" type="button" data-logs-refresh hidden>Refresh</button>
               <button class="small alt" type="button" data-logs-clear>Clear</button>
               <button class="small alt" type="button" data-workspace-action="logs">Hide</button>
             </div>
@@ -153,6 +255,8 @@
         <span class="legend-item"><i class="legend-dot legend-dot-tmux"></i> tmux</span>
         <span class="legend-item"><i class="legend-dot legend-dot-codex"></i> codex</span>
         <span class="legend-item"><i class="legend-dot legend-dot-claude"></i> claude</span>
+        <span class="legend-item"><i class="legend-dot legend-dot-cursor"></i> cursor</span>
+        <span class="legend-item"><i class="legend-dot legend-dot-opencode"></i> opencode</span>
       </div>
       <div id="terminalGrid" class="terminal-grid"></div>
       <p id="terminalGridEmpty" class="mono">No active sessions for this project.</p>
@@ -162,7 +266,12 @@
       <form id="appModalForm" method="dialog">
         <div class="app-modal-head">
           <h3 id="appModalTitle">Dialog</h3>
-          <button type="button" class="small alt" id="appModalClose">Close</button>
+          <button type="button" class="small alt icon-close-btn" id="appModalClose" aria-label="Close dialog" title="Close dialog">
+            <svg class="lucide close-icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M18 6 6 18"></path>
+              <path d="m6 6 12 12"></path>
+            </svg>
+          </button>
         </div>
         <div id="appModalBody" class="app-modal-body"></div>
         <div class="dialog-actions app-modal-actions">
