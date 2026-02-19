@@ -17,3 +17,4 @@ Short reflow animation improves spatial continuity and makes the snap result mor
 - Reflow now uses explicit FLIP transitions (`transform` tween) with a short swap cooldown to avoid abrupt rapid-fire reorders during drag.
 - Tuned interaction feel: increased dragged-tile scale emphasis and reduced reflow duration/cooldown for a snappier shuffle.
 - Drop release responsiveness was tightened by clearing drag state immediately on drop and shortening lock pulse duration.
+- Removed post-drop lock pulse; dragged tile now resets to normal size immediately on mouse release.

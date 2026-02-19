@@ -1,4 +1,5 @@
 const EMBEDDING_DIM = 256;
+const MAX_SAFE_POINT_ID = 9007199254740991; // Number.MAX_SAFE_INTEGER
 
 function normalizeString(value) {
   return String(value || '').trim();
@@ -29,6 +30,17 @@ function stableTokenHash(token) {
     hash = Math.imul(hash, 16777619);
   }
   return hash >>> 0;
+}
+
+function stablePointId(text) {
+  // Deterministically map arbitrary IDs to a Qdrant-safe unsigned integer.
+  let hash = 0;
+  const input = normalizeString(text);
+  for (let index = 0; index < input.length; index += 1) {
+    hash = (Math.imul(31, hash) + input.charCodeAt(index)) >>> 0;
+  }
+  const asNumber = Number(hash) || 1;
+  return Math.max(1, Math.min(MAX_SAFE_POINT_ID, asNumber));
 }
 
 function tokenize(text) {
@@ -133,7 +145,7 @@ export function createVectorAdapter() {
         {
           points: [
             {
-              id: String(memory.id),
+              id: stablePointId(`${memory.projectId}:${memory.id}`),
               vector,
               payload: {
                 id: String(memory.id),
@@ -200,7 +212,7 @@ export function createVectorAdapter() {
 
       const points = Array.isArray(result?.result) ? result.result : [];
       return points.map((point) => ({
-        id: String(point?.id || ''),
+        id: String(point?.payload?.id || point?.id || ''),
         score: Number(point?.score || 0),
         payload: point?.payload || {}
       })).filter((item) => item.id);

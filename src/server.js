@@ -13,6 +13,7 @@ import { isValidSkillTarget, isValidAgentsSystemId, agentsFilePath, skillFilePat
 import { ensureProjectLayout } from './project-scaffold.js';
 import { inspectProjectConfiguration } from './project-inspector.js';
 import { createGitWorktree, detectIsGitRepo as detectIsGitRepoPlugin, listGitRefs, listGitWorktrees, runGitForProject as runGitForProjectPlugin, runGitLocal } from './plugins/git.js';
+import { buildWorkspaceProviderSetupScript, detectWorkspaceProviderForProject, listWorkspaceProviderViews } from './plugins/workspace-providers.js';
 import { proxyMcpRequest } from './proxy.js';
 import { spawnSession, listSessions, refreshSessions, setSessionLastInput, stopSession, stopSessionsForProject } from './sessions.js';
 import { clearProjectMemories, listProjectMemories, removeProjectMemory, updateProjectMemory } from './memory.js';
@@ -45,9 +46,8 @@ const REMOTE_TMUX_CANDIDATES = [
   '/usr/bin/tmux'
 ].filter(Boolean);
 const SSH_SHARED_ARGS = [
-  '-o', 'ControlMaster=auto',
-  '-o', 'ControlPersist=10m',
-  '-o', 'ControlPath=/tmp/apropos-ssh-%C',
+  '-o', 'ControlMaster=no',
+  '-o', 'ControlPath=none',
   '-o', 'ConnectTimeout=8',
   '-o', 'ServerAliveInterval=20',
   '-o', 'ServerAliveCountMax=3'
@@ -57,6 +57,9 @@ const AGENT_IDLE_MS = 2600;
 const REMOTE_AGENT_POLL_INTERVAL_MS = 7000;
 const TERMINAL_INITIAL_SCROLLBACK_LINES = 20000;
 const TMUX_HISTORY_LIMIT_LINES = 50000;
+const DASHBOARD_SWITCH_SESSION_REFRESH_MIN_MS = 3500;
+const DASHBOARD_PROJECT_CACHE_TTL_MS = 15000;
+const ENABLE_REMOTE_PTY_ATTACH = process.env.APROPOS_ENABLE_REMOTE_PTY_ATTACH !== '0';
 const DRAFT_MCP_SERVER_SKILL = {
   name: 'draft mcp server',
   target: 'codex',
@@ -190,6 +193,10 @@ const memoryEngine = createMemoryEngine({
     }, 'warning');
   }
 });
+const workspaceContextCache = new Map();
+const projectDashboardCache = new Map();
+let sessionsRefreshInFlight = null;
+let lastSessionsRefreshAtMs = 0;
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -601,6 +608,19 @@ function ingestSessionInput(sessionId, rawInput) {
   return committed;
 }
 
+function normalizeCapturedPaneText(value) {
+  const text = String(value || '');
+  if (!text) {
+    return '';
+  }
+  return text
+    .replace(/\r/g, '')
+    .split('\n')
+    .map((line) => line.replace(/[ \t]+$/g, ''))
+    .join('\n')
+    .replace(/\n+$/g, '');
+}
+
 function shellQuote(value) {
   return `'${String(value ?? '').replace(/'/g, `'\\''`)}'`;
 }
@@ -620,12 +640,26 @@ function buildRemoteTmuxCommand(args) {
     '  exit 127',
     'fi',
     `"$tmux_bin" ${argsQuoted}`
+  ].join('\n');
+}
+
+function wrapRemotePosixCommand(command) {
+  const encoded = Buffer.from(String(command || ''), 'utf8').toString('base64');
+  const bootstrap = [
+    'tmp_file="$(mktemp /tmp/apropos-cmd-XXXXXX.sh 2>/dev/null || mktemp)"',
+    `if printf %s QQ== | base64 -d >/dev/null 2>&1; then printf %s ${encoded} | base64 -d > "$tmp_file"; else printf %s ${encoded} | base64 -D > "$tmp_file"; fi`,
+    '/bin/sh "$tmp_file"',
+    'status=$?',
+    'rm -f -- "$tmp_file"',
+    'exit "$status"'
   ].join('; ');
+  return `/bin/sh -c ${shellQuote(bootstrap)}`;
 }
 
 function runSsh(sshHost, command) {
+  const wrapped = wrapRemotePosixCommand(command);
   return new Promise((resolve, reject) => {
-    execFile('ssh', [...SSH_SHARED_ARGS, sshHost, command], (error, stdout, stderr) => {
+    execFile('ssh', [...SSH_SHARED_ARGS, sshHost, wrapped], (error, stdout, stderr) => {
       if (error) {
         reject(new Error(stderr || error.message));
         return;
@@ -718,7 +752,8 @@ function parseGitStatusPorcelain(rawOutput) {
 function execTmuxForSession(session, args, callback) {
   if (session.sshHost) {
     const command = buildRemoteTmuxCommand(args);
-    execFile('ssh', [...SSH_SHARED_ARGS, session.sshHost, command], callback);
+    const wrapped = wrapRemotePosixCommand(command);
+    execFile('ssh', [...SSH_SHARED_ARGS, session.sshHost, wrapped], callback);
     return;
   }
   execFile(TMUX_BIN, args, callback);
@@ -840,6 +875,46 @@ async function readAutomationRaw(project, automationId) {
   return fs.readFile(filePath, 'utf8');
 }
 
+function parseAutomationParams(raw) {
+  if (!Array.isArray(raw) || !raw.length) {
+    return [];
+  }
+  return raw.map((p, i) => {
+    const name = String(p?.name || '').trim();
+    if (!name) {
+      throw new Error(`params[${i}].name is required`);
+    }
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+      throw new Error(`params[${i}].name "${name}" must be alphanumeric/underscore`);
+    }
+    return {
+      name,
+      label: String(p?.label || name).trim(),
+      default: p?.default === undefined ? '' : String(p.default),
+      required: p?.required !== false
+    };
+  });
+}
+
+function substituteParams(command, params, inputParams) {
+  if (!command || !params.length) {
+    return command;
+  }
+  let result = command;
+  for (const param of params) {
+    const value = inputParams?.[param.name] !== undefined
+      ? String(inputParams[param.name])
+      : param.default;
+    // Replace ${PARAM} (braced form) first — always safe
+    result = result.split(`\${${param.name}}`).join(value);
+    // Replace $PARAM only at word boundary to avoid greedy matches
+    // e.g. $VIEW_NAME must not match inside $VIEW_NAME_EXTRA
+    const bare = new RegExp(`\\$${param.name}(?![A-Za-z0-9_])`, 'g');
+    result = result.replace(bare, value);
+  }
+  return result;
+}
+
 function parseAutomationPayload(raw, fallbackName) {
   const payload = safeJsonParse(String(raw || ''));
   if (!payload || typeof payload !== 'object') {
@@ -850,6 +925,8 @@ function parseAutomationPayload(raw, fallbackName) {
   if (!sessions.length) {
     throw new Error('Automation requires sessions[]');
   }
+
+  const params = parseAutomationParams(payload.params);
 
   const normalizedSessions = sessions.map((session, index) => {
     const kind = String(session?.kind || '').trim();
@@ -865,6 +942,7 @@ function parseAutomationPayload(raw, fallbackName) {
 
   return {
     name: String(payload.name || fallbackName || 'automation').trim(),
+    params,
     sessions: normalizedSessions
   };
 }
@@ -1057,18 +1135,16 @@ function pollAgentSessionQuestions() {
     if (!AGENT_SESSION_KINDS.has(session.kind)) {
       continue;
     }
+    if (session.sshHost) {
+      // Remote background pane polling creates extra SSH sessions that can
+      // destabilize interactive attaches on constrained SSHD setups.
+      // Keep remote terminals stable by skipping this optional notifier path.
+      continue;
+    }
     const state = ensureAgentState(session.id);
     const seededLastInput = String(session.lastInput || '').trim();
     if (!state.lastInputAtMs && seededLastInput && seededLastInput.toLowerCase() !== String(session.kind || '').toLowerCase()) {
       state.lastInputAtMs = now;
-    }
-    if (session.sshHost) {
-      // Poll remote panes on a throttled cadence so background projects still
-      // generate question/completion notifications without continuous SSH churn.
-      if (now - state.lastRemotePollAtMs < REMOTE_AGENT_POLL_INTERVAL_MS) {
-        continue;
-      }
-      state.lastRemotePollAtMs = now;
     }
     execTmuxForSession(session, ['capture-pane', '-p', '-J', '-S', '-120', '-t', session.tmuxName], (error, stdout) => {
       if (error) {
@@ -1101,9 +1177,157 @@ async function detectIsGitRepoForProject(project) {
   return detectIsGitRepoPlugin(project);
 }
 
+async function detectWorkspaceContextForProject(project, isGit = null) {
+  const effectiveIsGit = typeof isGit === 'boolean' ? isGit : await detectIsGitRepoForProject(project);
+  if (effectiveIsGit) {
+    return { type: 'git', provider: null };
+  }
+  const cacheKey = `${project.id}:${project.updatedAt || ''}:${project.path}:${project.sshHost || ''}`;
+  const cached = workspaceContextCache.get(cacheKey);
+  if (cached && (Date.now() - cached.atMs) < 15000) {
+    return cached.value;
+  }
+  const provider = await detectWorkspaceProviderForProject(project, runSsh);
+  const value = provider
+    ? {
+      type: 'provider',
+      provider: {
+        id: provider.id,
+        name: provider.name
+      }
+    }
+    : { type: 'default', provider: null };
+  workspaceContextCache.clear();
+  workspaceContextCache.set(cacheKey, { atMs: Date.now(), value });
+  return value;
+}
+
 async function sanitizeProjectLive(project) {
   const isGit = await detectIsGitRepoForProject(project);
-  return sanitizeProject(project, { isGit });
+  const workspaceContext = await detectWorkspaceContextForProject(project, isGit);
+  return sanitizeProject(project, { isGit, workspaceContext });
+}
+
+function projectDashboardSignature(project) {
+  return [
+    project.id,
+    project.updatedAt || '',
+    project.path || '',
+    project.sshHost || ''
+  ].join('|');
+}
+
+function pruneProjectDashboardCache(projectIds = []) {
+  const activeIds = new Set(projectIds);
+  for (const projectId of projectDashboardCache.keys()) {
+    if (!activeIds.has(projectId)) {
+      projectDashboardCache.delete(projectId);
+    }
+  }
+}
+
+async function buildDashboardProject(project) {
+  const sanitized = await sanitizeProjectLive(project);
+  const catalog = buildMcpCatalogForProject(project);
+  const inspected = await inspectProjectConfiguration(project, catalog);
+  return {
+    ...sanitized,
+    mcpRepositories: normalizeProjectMcpRepositories(project),
+    mcpCatalog: catalog,
+    mcpTools: inspected.mcpTools,
+    skills: inspected.skills,
+    structure: inspected.structure
+  };
+}
+
+async function getDashboardProject(project, { preferCached = false } = {}) {
+  const now = Date.now();
+  const signature = projectDashboardSignature(project);
+  const cached = projectDashboardCache.get(project.id);
+  if (cached && cached.signature === signature && cached.data && cached.expiresAtMs > now) {
+    return cached.data;
+  }
+
+  if (preferCached && cached?.signature === signature && cached?.data) {
+    if (!cached.promise) {
+      const promise = buildDashboardProject(project)
+        .then((data) => {
+          projectDashboardCache.set(project.id, {
+            signature,
+            data,
+            expiresAtMs: Date.now() + DASHBOARD_PROJECT_CACHE_TTL_MS,
+            promise: null
+          });
+          return data;
+        })
+        .catch(() => {
+          const current = projectDashboardCache.get(project.id);
+          if (current?.signature === signature) {
+            current.promise = null;
+          }
+        });
+      projectDashboardCache.set(project.id, {
+        signature,
+        data: cached.data,
+        expiresAtMs: cached.expiresAtMs,
+        promise
+      });
+    }
+    return cached.data;
+  }
+
+  if (cached?.signature === signature && cached.promise) {
+    return cached.promise;
+  }
+
+  const promise = buildDashboardProject(project).then((data) => {
+    projectDashboardCache.set(project.id, {
+      signature,
+      data,
+      expiresAtMs: Date.now() + DASHBOARD_PROJECT_CACHE_TTL_MS,
+      promise: null
+    });
+    return data;
+  });
+  projectDashboardCache.set(project.id, {
+    signature,
+    data: cached?.signature === signature ? cached.data : null,
+    expiresAtMs: cached?.expiresAtMs || 0,
+    promise
+  });
+  try {
+    return await promise;
+  } catch (error) {
+    const current = projectDashboardCache.get(project.id);
+    if (current?.signature === signature) {
+      current.promise = null;
+    }
+    throw error;
+  }
+}
+
+async function refreshSessionsMaybe({ force = false, wait = true, minIntervalMs = 0 } = {}) {
+  const now = Date.now();
+  const stale = (now - lastSessionsRefreshAtMs) >= minIntervalMs;
+  if (!force && !stale) {
+    return null;
+  }
+
+  if (!sessionsRefreshInFlight) {
+    sessionsRefreshInFlight = refreshSessions(getProject, currentState().projects)
+      .then((result) => {
+        lastSessionsRefreshAtMs = Date.now();
+        return result;
+      })
+      .finally(() => {
+        sessionsRefreshInFlight = null;
+      });
+  }
+
+  if (wait) {
+    return sessionsRefreshInFlight;
+  }
+  return null;
 }
 
 async function ensureProjectLayoutRemote(sshHost, projectPath) {
@@ -1519,23 +1743,18 @@ app.get('/api/health', (_req, res) => {
   res.json({ ok: true, now: new Date().toISOString() });
 });
 
-app.get('/api/dashboard', async (_req, res) => {
-  await refreshSessions(getProject, currentState().projects);
+app.get('/api/dashboard', async (req, res) => {
+  const mode = String(req.query?.mode || '').trim().toLowerCase();
+  const fastSwitchMode = mode === 'switch';
+  if (fastSwitchMode) {
+    void refreshSessionsMaybe({ force: false, wait: false, minIntervalMs: DASHBOARD_SWITCH_SESSION_REFRESH_MIN_MS });
+  } else {
+    await refreshSessionsMaybe({ force: false, wait: true, minIntervalMs: 0 });
+  }
   const state = currentState();
+  pruneProjectDashboardCache((state.projects || []).map((project) => project.id));
   const projects = await Promise.all(
-    state.projects.map(async (project) => {
-      const sanitized = await sanitizeProjectLive(project);
-      const catalog = buildMcpCatalogForProject(project);
-      const inspected = await inspectProjectConfiguration(project, catalog);
-      return {
-        ...sanitized,
-        mcpRepositories: normalizeProjectMcpRepositories(project),
-        mcpCatalog: catalog,
-        mcpTools: inspected.mcpTools,
-        skills: inspected.skills,
-        structure: inspected.structure
-      };
-    })
+    state.projects.map((project) => getDashboardProject(project, { preferCached: fastSwitchMode }))
   );
   const globalCatalog = projects.flatMap((project) => project.mcpCatalog || []);
   res.json({
@@ -2869,10 +3088,27 @@ async function listProjectSessionWorktrees(project) {
 }
 
 async function resolveSessionWorkspace(project, workspacePayload) {
+  const workspaceMode = String(workspacePayload?.mode || 'main').trim().toLowerCase();
+  const workspaceContext = await detectWorkspaceContextForProject(project);
+  if (workspaceContext.type === 'provider' && workspaceContext.provider?.id) {
+    const provider = await detectWorkspaceProviderForProject(project, runSsh);
+    if (provider && provider.id === workspaceContext.provider.id) {
+      const setupScript = buildWorkspaceProviderSetupScript(provider, workspacePayload, project.path);
+      const workspaceName = workspaceMode === 'provider-view' || workspaceMode === 'provider-create'
+        ? String(workspacePayload?.name || '').trim() || provider.id
+        : 'main';
+      return {
+        workspacePath: project.path,
+        workspaceName,
+        created: workspaceMode === 'provider-create',
+        setupScript
+      };
+    }
+  }
   const mode = String(workspacePayload?.mode || 'main').trim().toLowerCase();
   const isGit = await detectIsGitRepoForProject(project);
   if (!isGit || mode === 'main') {
-    return { workspacePath: project.path, workspaceName: 'main', created: false };
+    return { workspacePath: project.path, workspaceName: 'main', created: false, setupScript: '' };
   }
   const root = await resolveWorktreeRootForProject(project);
   if (mode === 'create') {
@@ -2886,7 +3122,7 @@ async function resolveSessionWorkspace(project, workspacePayload) {
       baseRef: String(workspacePayload?.baseRef || 'HEAD').trim() || 'HEAD',
       runRemote: runSsh
     });
-    return { workspacePath: created.path, workspaceName: created.name, created: true };
+    return { workspacePath: created.path, workspaceName: created.name, created: true, setupScript: '' };
   }
   if (mode === 'worktree') {
     const name = String(workspacePayload?.name || '').trim();
@@ -2898,10 +3134,30 @@ async function resolveSessionWorkspace(project, workspacePayload) {
     if (!selected) {
       throw new Error(`Unknown worktree "${name}".`);
     }
-    return { workspacePath: selected.path, workspaceName: selected.name, created: false };
+    return { workspacePath: selected.path, workspaceName: selected.name, created: false, setupScript: '' };
   }
   throw new Error('workspace.mode must be one of main, worktree, create');
 }
+
+app.get('/api/projects/:projectId/workspace-context', async (req, res) => {
+  const project = getProject(req.params.projectId);
+  if (!project) {
+    res.status(404).json({ error: 'Project not found' });
+    return;
+  }
+  try {
+    const context = await detectWorkspaceContextForProject(project);
+    if (context.type !== 'provider' || !context.provider?.id) {
+      res.json({ context, views: [] });
+      return;
+    }
+    const provider = await detectWorkspaceProviderForProject(project, runSsh);
+    const views = provider ? await listWorkspaceProviderViews(project, provider, runSsh) : [];
+    res.json({ context, views });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
 
 app.get('/api/projects/:projectId/worktrees', async (req, res) => {
   const project = getProject(req.params.projectId);
@@ -3016,13 +3272,14 @@ app.post('/api/projects/:projectId/sessions', async (req, res) => {
       kind,
       rawCommand: command,
       prompt: launchPrompt || undefined,
+      setupScript: resolvedWorkspace.setupScript || '',
       workspacePath: resolvedWorkspace.workspacePath,
       workspaceName: resolvedWorkspace.workspaceName
     });
     await refreshSessions(getProject, currentState().projects);
     res.status(201).json({ session });
   } catch (error) {
-    if (error.code === 'MISSING_CLI' || error.code === 'AGENT_EXITED_EARLY') {
+    if (error.code === 'MISSING_CLI' || error.code === 'AGENT_EXITED_EARLY' || error.code === 'TMUX_EXITED_EARLY') {
       res.status(400).json({
         error: error.message,
         code: error.code,
@@ -3062,7 +3319,8 @@ app.get('/api/projects/:projectId/automations', async (req, res) => {
         automations.push({
           id,
           name: parsed.name,
-          sessionCount: parsed.sessions.length
+          sessionCount: parsed.sessions.length,
+          params: parsed.params
         });
       } catch (error) {
         automations.push({
@@ -3093,15 +3351,28 @@ app.post('/api/projects/:projectId/automations/run', async (req, res) => {
     return;
   }
 
+  const inputParams = req.body?.inputParams && typeof req.body.inputParams === 'object'
+    ? req.body.inputParams
+    : {};
+
   try {
     const raw = await readAutomationRaw(project, automationId);
     const automation = parseAutomationPayload(raw, automationId.replace(/\.json$/i, ''));
+
+    for (const param of automation.params) {
+      if (param.required && !String(inputParams[param.name] ?? '').trim() && !String(param.default || '').trim()) {
+        res.status(400).json({ error: `Missing required param: ${param.name}` });
+        return;
+      }
+    }
+
     const launched = [];
     for (const spec of automation.sessions) {
+      const resolvedCommand = substituteParams(spec.command, automation.params, inputParams);
       const session = await spawnSession({
         project,
         kind: spec.kind,
-        rawCommand: spec.command
+        rawCommand: resolvedCommand
       });
       launched.push(session);
     }
@@ -3332,6 +3603,8 @@ wss.on('connection', (ws, request) => {
   execTmuxForSession(session, ['set-option', '-t', session.tmuxName, 'mouse', 'off'], () => {});
   // Hide tmux status bar in embedded terminals.
   execTmuxForSession(session, ['set-option', '-t', session.tmuxName, 'status', 'off'], () => {});
+  // Eliminate escape-time delay so arrow key sequences are recognized immediately.
+  execTmuxForSession(session, ['set-option', '-s', 'escape-time', '0'], () => {});
   // Reinforce global history depth in case tmux user config sets it very low.
   execTmuxForSession(session, ['set-window-option', '-g', 'history-limit', String(TMUX_HISTORY_LIMIT_LINES)], () => {});
   // Ensure deep tmux history for browser-backed scrolling.
@@ -3342,12 +3615,12 @@ wss.on('connection', (ws, request) => {
 
   let ptyProcess;
   try {
-    if (!ptyModule) {
+    if (!ptyModule || (session.sshHost && !ENABLE_REMOTE_PTY_ATTACH)) {
       throw new Error('PTY unavailable');
     }
     const ptyBin = session.sshHost ? 'ssh' : TMUX_BIN;
     const ptyArgs = session.sshHost
-      ? [...SSH_SHARED_ARGS, '-t', session.sshHost, buildRemoteTmuxCommand(['attach', '-t', session.tmuxName])]
+      ? [...SSH_SHARED_ARGS, '-t', session.sshHost, wrapRemotePosixCommand(buildRemoteTmuxCommand(['attach', '-t', session.tmuxName]))]
       : ['attach', '-t', session.tmuxName];
     ptyProcess = ptyModule.spawn(ptyBin, ptyArgs, {
       name: 'xterm-256color',
@@ -3385,7 +3658,7 @@ wss.on('connection', (ws, request) => {
           if (captureErr || closed || ws.readyState !== ws.OPEN) {
             return;
           }
-          const snapshot = String(stdout || '').replace(/\n+$/g, '');
+          const snapshot = normalizeCapturedPaneText(stdout);
           if (snapshot) {
             ws.send(JSON.stringify({ type: 'history', data: snapshot }));
           }
@@ -3399,7 +3672,7 @@ wss.on('connection', (ws, request) => {
         if (closed || captureErr) {
           return;
         }
-        const normalized = String(stdout).replace(/\n+$/g, '');
+        const normalized = normalizeCapturedPaneText(stdout);
         if (normalized !== lastScreen) {
           lastScreen = normalized;
           ws.send(JSON.stringify({ type: 'screen', data: normalized }));
@@ -3481,7 +3754,7 @@ wss.on('connection', (ws, request) => {
         if (captureErr || ws.readyState !== ws.OPEN) {
           return;
         }
-        const snapshot = String(stdout || '').replace(/\n+$/g, '');
+        const snapshot = normalizeCapturedPaneText(stdout);
         if (snapshot) {
           ws.send(JSON.stringify({ type: 'history', data: snapshot }));
         }

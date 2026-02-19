@@ -249,6 +249,9 @@ export async function persistState() {
 
 export function sanitizeProject(project, overrides = {}) {
   const isGit = typeof overrides.isGit === 'boolean' ? overrides.isGit : Boolean(project.isGit);
+  const workspaceContext = overrides.workspaceContext && typeof overrides.workspaceContext === 'object'
+    ? overrides.workspaceContext
+    : { type: 'default', provider: null };
   return {
     id: project.id,
     name: project.name,
@@ -257,6 +260,7 @@ export function sanitizeProject(project, overrides = {}) {
     isRemote: Boolean(project.sshHost),
     color: project.color,
     isGit,
+    workspaceContext,
     docsDir: path.join(project.path, 'docs'),
     agentsSymlinkOk: project.agentsSymlinkOk,
     mcpRepositories: normalizeMcpRepositories(project.mcpRepositories),

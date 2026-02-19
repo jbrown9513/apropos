@@ -24,6 +24,16 @@ function normalizeMappings(input) {
   return normalized;
 }
 
+function normalizeRules(input) {
+  const source = input && typeof input === 'object' && !Array.isArray(input)
+    ? input
+    : {};
+  const rules = Array.isArray(source.rules) ? source.rules : [];
+  return rules
+    .map((line) => String(line || '').trim())
+    .filter(Boolean);
+}
+
 async function readJsonIfExists(filePath) {
   try {
     const raw = await fs.readFile(filePath, 'utf8');
@@ -81,6 +91,12 @@ async function loadVcsMappingsForWorkspace(workspacePath) {
   ]);
   const globalMappings = normalizeMappings(globalConfig);
   const projectMappings = normalizeMappings(projectConfig);
+  const ruleLines = [
+    ...normalizeRules(globalConfig),
+    ...pluginConfigs.flatMap((config) => normalizeRules(config)),
+    ...normalizeRules(projectConfig)
+  ];
+  const uniqueRuleLines = [...new Set(ruleLines)];
   const bySource = new Map(globalMappings.map((item) => [item.from, item.to]));
   for (const config of pluginConfigs) {
     for (const item of normalizeMappings(config)) {
@@ -95,6 +111,7 @@ async function loadVcsMappingsForWorkspace(workspacePath) {
     .sort((a, b) => a.from.localeCompare(b.from));
   return {
     mappings: merged,
+    ruleLines: uniqueRuleLines,
     sources: {
       globalPath: GLOBAL_MAPPINGS_PATH,
       projectPath,
@@ -120,6 +137,13 @@ function renderVcsRules({ mappings, sources }) {
     }
     lines.push('');
   }
+  if (Array.isArray(sources.ruleLines) && sources.ruleLines.length) {
+    lines.push('## Plugin Workflow Rules', '');
+    for (const line of sources.ruleLines) {
+      lines.push(`- ${line}`);
+    }
+    lines.push('');
+  }
   lines.push('## Mapping Sources', '');
   lines.push(`- Global: \`${sources.globalPath}\``);
   if (Array.isArray(sources.pluginMappingFiles) && sources.pluginMappingFiles.length) {
@@ -133,8 +157,8 @@ function renderVcsRules({ mappings, sources }) {
 }
 
 async function ensureSessionRulesFiles(workspacePath) {
+  const content = await buildVcsRulesContentForWorkspace(workspacePath);
   const loaded = await loadVcsMappingsForWorkspace(workspacePath);
-  const content = renderVcsRules(loaded);
   const ruleFiles = [
     path.join(workspacePath, 'codex', 'rules', 'apropos-vcs.md'),
     path.join(workspacePath, '.codex', 'rules', 'apropos-vcs.md'),
@@ -150,7 +174,19 @@ async function ensureSessionRulesFiles(workspacePath) {
   };
 }
 
+async function buildVcsRulesContentForWorkspace(workspacePath) {
+  const loaded = await loadVcsMappingsForWorkspace(workspacePath);
+  return renderVcsRules({
+    mappings: loaded.mappings,
+    sources: {
+      ...loaded.sources,
+      ruleLines: loaded.ruleLines
+    }
+  });
+}
+
 export {
+  buildVcsRulesContentForWorkspace,
   GLOBAL_MAPPINGS_PATH,
   ensureSessionRulesFiles,
   loadVcsMappingsForWorkspace

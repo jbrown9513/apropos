@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { nanoid } from 'nanoid';
 import { trackAlert, trackEvent } from './events.js';
-import { ensureSessionRulesFiles } from './plugins/vcs-mappings.js';
+import { buildVcsRulesContentForWorkspace, ensureSessionRulesFiles } from './plugins/vcs-mappings.js';
 
 const sessions = [];
 const SESSION_PREFIX_RE = /^([A-Za-z0-9_-]+)-(tmux|codex|claude|cursor|opencode)-([A-Za-z0-9_-]+)$/;
@@ -15,10 +15,21 @@ const REMOTE_TMUX_CANDIDATES = [
   '/usr/bin/tmux'
 ].filter(Boolean);
 const TMUX_HISTORY_LIMIT_LINES = '50000';
+const AGENT_INSTALL_DOCS = {
+  codex: 'https://github.com/openai/codex',
+  claude: 'https://docs.anthropic.com/en/docs/claude-code/quickstart',
+  cursor: 'https://cursor.com/cli',
+  opencode: 'https://opencode.ai/'
+};
+const AGENT_BREW_PACKAGES = {
+  codex: ['codex'],
+  claude: ['claude-code'],
+  cursor: ['cursor-cli', 'cursor-agent', '--cask cursor'],
+  opencode: ['opencode']
+};
 const SSH_SHARED_ARGS = [
-  '-o', 'ControlMaster=auto',
-  '-o', 'ControlPersist=10m',
-  '-o', 'ControlPath=/tmp/apropos-ssh-%C',
+  '-o', 'ControlMaster=no',
+  '-o', 'ControlPath=none',
   '-o', 'ConnectTimeout=8',
   '-o', 'ServerAliveInterval=20',
   '-o', 'ServerAliveCountMax=3'
@@ -38,8 +49,18 @@ function commandName(command) {
 }
 
 function runSsh(sshHost, command, cwd) {
+  const script = cwd ? `cd ${shellQuote(cwd)} && ${command}` : String(command || '');
+  const encoded = Buffer.from(script, 'utf8').toString('base64');
+  const bootstrap = [
+    'tmp_file="$(mktemp /tmp/apropos-cmd-XXXXXX.sh 2>/dev/null || mktemp)"',
+    `if printf %s QQ== | base64 -d >/dev/null 2>&1; then printf %s ${encoded} | base64 -d > "$tmp_file"; else printf %s ${encoded} | base64 -D > "$tmp_file"; fi`,
+    '/bin/sh "$tmp_file"',
+    'status=$?',
+    'rm -f -- "$tmp_file"',
+    'exit "$status"'
+  ].join('; ');
+  const wrapped = `/bin/sh -c ${shellQuote(bootstrap)}`;
   return new Promise((resolve, reject) => {
-    const wrapped = cwd ? `cd ${shellQuote(cwd)} && ${command}` : command;
     execFile('ssh', [...SSH_SHARED_ARGS, sshHost, wrapped], (error, stdout, stderr) => {
       if (error) {
         reject(new Error(stderr || error.message));
@@ -48,6 +69,22 @@ function runSsh(sshHost, command, cwd) {
       resolve(stdout.trim());
     });
   });
+}
+
+async function ensureSessionRulesFilesRemote(workspacePath, sshHost) {
+  const content = await buildVcsRulesContentForWorkspace(workspacePath);
+  const targets = [
+    `${workspacePath.replace(/[\\]+/g, '/')}/codex/rules/apropos-vcs.md`,
+    `${workspacePath.replace(/[\\]+/g, '/')}/.codex/rules/apropos-vcs.md`,
+    `${workspacePath.replace(/[\\]+/g, '/')}/.claude/rules/apropos-vcs.md`
+  ];
+  const commands = ['set -e'];
+  for (const target of targets) {
+    const dir = target.slice(0, target.lastIndexOf('/'));
+    commands.push(`mkdir -p ${shellQuote(dir)}`);
+    commands.push(`printf %s ${shellQuote(content + '\n')} > ${shellQuote(target)}`);
+  }
+  await runSsh(sshHost, commands.join('; '));
 }
 
 async function commandExists(command, project) {
@@ -104,7 +141,7 @@ function runTmuxRemote(sshHost, args, cwd) {
     '  exit 127',
     'fi',
     `"$tmux_bin" ${argsQuoted}`
-  ].join('; ');
+  ].join('\n');
   return runSsh(sshHost, command, cwd);
 }
 
@@ -138,11 +175,14 @@ function buildCommand(kind, rawCommand, projectPath, isRemote = false) {
     if (rawCommand) {
       return rawCommand;
     }
+    if (isRemote) {
+      return `cd ${shellQuote(projectPath)} && exec "\${SHELL:-/bin/sh}"`;
+    }
     const shell = process.env.SHELL || 'zsh';
     return `cd ${shellQuote(projectPath)} && exec ${shellQuote(shell)}`;
   }
   if (kind === 'codex') {
-    return rawCommand || (isRemote ? 'npx -y @openai/codex' : 'codex');
+    return rawCommand || 'codex';
   }
   if (kind === 'claude') {
     return rawCommand || 'claude';
@@ -167,6 +207,46 @@ function buildPromptCommand(_kind, command, _prompt) {
   return command;
 }
 
+async function resolveRemoteCommandPath(project, command, cwd) {
+  if (!project?.sshHost) {
+    return command;
+  }
+  const executable = commandName(command);
+  if (!executable || executable.includes('/')) {
+    return command;
+  }
+  const trimmed = String(command || '').trim();
+  if (!trimmed.startsWith(executable)) {
+    return command;
+  }
+  const suffix = trimmed.slice(executable.length);
+  if (suffix && !/^\s/.test(suffix)) {
+    return command;
+  }
+
+  const resolveScript = [
+    `if command -v ${shellQuote(executable)} >/dev/null 2>&1; then command -v ${shellQuote(executable)}; exit 0; fi`,
+    `for candidate_dir in "$HOME/.local/bin" "/usr/dev_infra/generic/bin" "/usr/local/bin" "/usr/bin" "/bin"; do`,
+    `  if [ -x "$candidate_dir/${executable}" ]; then printf '%s\\n' "$candidate_dir/${executable}"; exit 0; fi`,
+    'done',
+    "printf '\\n'"
+  ].join('\n');
+
+  let resolved = '';
+  try {
+    resolved = String(await runSsh(project.sshHost, resolveScript, cwd))
+      .split('\n')
+      .map((line) => String(line || '').trim())
+      .find(Boolean) || '';
+  } catch {
+    resolved = '';
+  }
+  if (!resolved) {
+    return command;
+  }
+  return `${shellQuote(resolved)}${suffix}`;
+}
+
 function deriveInitialLastInput({ prompt }) {
   const promptText = String(prompt || '').trim();
   if (promptText) {
@@ -181,6 +261,103 @@ function normalizeTmuxSize(value) {
     return null;
   }
   return String(parsed);
+}
+
+function buildInstallerCommand(kind, executable) {
+  const binary = String(executable || kind || '').trim() || kind;
+  const docsUrl = AGENT_INSTALL_DOCS[kind] || '';
+  const packageAttempts = (AGENT_BREW_PACKAGES[kind] || [binary])
+    .map((name) => `brew install ${name}`)
+    .join(' || ');
+  return [
+    `echo ${shellQuote(`Missing CLI: ${binary}`)}`,
+    'if command -v brew >/dev/null 2>&1; then',
+    `  ${packageAttempts} || true`,
+    'else',
+    '  echo "Homebrew is not installed. Install Homebrew first: https://brew.sh"',
+    'fi',
+    `echo ${shellQuote(`Verify availability: command -v ${binary}`)}`,
+    docsUrl ? `echo ${shellQuote(`Docs: ${docsUrl}`)}` : 'true',
+    'exec "${SHELL:-zsh}"'
+  ].join('\n');
+}
+
+async function spawnInstallerSession({
+  project,
+  kind,
+  executable,
+  sessionPath,
+  sessionWorkspaceName,
+  tmuxWidth,
+  tmuxHeight
+}) {
+  const tmuxName = `${project.id}-tmux-${nanoid(5)}`;
+  const installCommand = buildInstallerCommand(kind, executable);
+  const newSessionArgs = ['new-session', '-d', '-s', tmuxName];
+  if (tmuxWidth) {
+    newSessionArgs.push('-x', tmuxWidth);
+  }
+  if (tmuxHeight) {
+    newSessionArgs.push('-y', tmuxHeight);
+  }
+  newSessionArgs.push('-c', sessionPath, installCommand);
+  await runTmuxForProject(project, newSessionArgs, sessionPath);
+
+  try {
+    await runTmuxForProject(project, ['set-window-option', '-g', 'history-limit', TMUX_HISTORY_LIMIT_LINES], sessionPath);
+    await runTmuxForProject(project, ['set-option', '-s', 'escape-time', '0'], sessionPath);
+    await runTmuxForProject(project, ['set-option', '-t', tmuxName, 'mouse', 'off'], sessionPath);
+    await runTmuxForProject(project, ['set-option', '-t', tmuxName, 'status', 'off'], sessionPath);
+    await runTmuxForProject(project, ['set-window-option', '-t', tmuxName, 'history-limit', TMUX_HISTORY_LIMIT_LINES], sessionPath);
+  } catch {
+    // Ignore optional tmux UI setting failures.
+  }
+
+  if (tmuxWidth || tmuxHeight) {
+    const resizeArgs = ['resize-window', '-t', tmuxName];
+    if (tmuxWidth) {
+      resizeArgs.push('-x', tmuxWidth);
+    }
+    if (tmuxHeight) {
+      resizeArgs.push('-y', tmuxHeight);
+    }
+    await runTmuxForProject(project, resizeArgs, sessionPath);
+  }
+
+  const session = {
+    id: sessionIdFrom(project.sshHost, tmuxName),
+    projectId: project.id,
+    projectName: project.name,
+    kind: 'tmux',
+    command: installCommand,
+    tmuxName,
+    sshHost: project.sshHost || null,
+    workspacePath: sessionPath,
+    workspaceName: sessionWorkspaceName,
+    lastInput: '',
+    startedAt: new Date().toISOString()
+  };
+  sessions.unshift(session);
+
+  await trackEvent('session.started', {
+    projectId: project.id,
+    projectName: project.name,
+    kind: 'tmux',
+    tmuxName,
+    command: installCommand,
+    workspacePath: sessionPath,
+    workspaceName: sessionWorkspaceName,
+    sshHost: project.sshHost || null
+  });
+  await trackAlert('session.cli_missing_installer_opened', {
+    projectId: project.id,
+    projectName: project.name,
+    missingKind: kind,
+    executable,
+    sshHost: project.sshHost || null,
+    workspacePath: sessionPath
+  }, 'warning');
+  return session;
 }
 
 async function tmuxSessionExists(project, tmuxName) {
@@ -271,11 +448,16 @@ export async function refreshSessions(projectLookup, projects = []) {
   return sessions;
 }
 
-export async function spawnSession({ project, kind, rawCommand, prompt, workspacePath, workspaceName }) {
+export async function spawnSession({ project, kind, rawCommand, prompt, setupScript, workspacePath, workspaceName }) {
   const sessionPath = String(workspacePath || project.path || '').trim() || project.path;
   const sessionWorkspaceName = String(workspaceName || 'main').trim() || 'main';
-  const baseCommand = buildCommand(kind, rawCommand, sessionPath, Boolean(project.sshHost));
-  const command = buildPromptCommand(kind, baseCommand, prompt);
+  const setup = String(setupScript || '').trim();
+  const defaultTmuxShell = kind === 'tmux' && !String(rawCommand || '').trim();
+  const baseCommand = defaultTmuxShell ? '' : buildCommand(kind, rawCommand, sessionPath, Boolean(project.sshHost));
+  let command = buildPromptCommand(kind, baseCommand, prompt);
+  if (project.sshHost && AGENT_KINDS.has(kind) && command) {
+    command = await resolveRemoteCommandPath(project, command, sessionPath);
+  }
   const promptInjectedInCommand = command !== baseCommand;
   const normalizedPrompt = String(prompt ?? '').trim();
   const initialLastInput = deriveInitialLastInput({ prompt });
@@ -283,24 +465,33 @@ export async function spawnSession({ project, kind, rawCommand, prompt, workspac
   const tmuxWidth = normalizeTmuxSize(process.env.TMUX_COLS);
   const tmuxHeight = normalizeTmuxSize(process.env.TMUX_ROWS);
   if (AGENT_KINDS.has(kind)) {
-    // Remote sessions skip preflight command existence checks to avoid an extra
-    // SSH round trip and reduce launch latency.
+    // Remote hosts can expose agent CLIs through shell-specific PATH setup
+    // that does not reliably appear in non-interactive probes. Launch directly
+    // on remote and let runtime startup checks report real failures.
     if (!project.sshHost) {
+      const executable = commandName(command);
       const available = await commandExists(command, { ...project, path: sessionPath });
       if (!available) {
-        const error = new Error(
-          `${kind} is not installed. Download/install ${kind} and ensure it is on PATH, then retry.`
-        );
-        error.code = 'MISSING_CLI';
-        error.kind = kind;
-        throw error;
+        return spawnInstallerSession({
+          project,
+          kind,
+          executable,
+          sessionPath,
+          sessionWorkspaceName,
+          tmuxWidth,
+          tmuxHeight
+        });
       }
     }
   }
 
   try {
-    if (AGENT_KINDS.has(kind) && !project.sshHost) {
-      await ensureSessionRulesFiles(sessionPath);
+    if (AGENT_KINDS.has(kind)) {
+      if (project.sshHost) {
+        await ensureSessionRulesFilesRemote(sessionPath, project.sshHost);
+      } else {
+        await ensureSessionRulesFiles(sessionPath);
+      }
     }
     const newSessionArgs = ['new-session', '-d', '-s', tmuxName];
     if (tmuxWidth) {
@@ -309,16 +500,49 @@ export async function spawnSession({ project, kind, rawCommand, prompt, workspac
     if (tmuxHeight) {
       newSessionArgs.push('-y', tmuxHeight);
     }
-    // For remote agent sessions, launch from the user's login shell so agent
-    // auth/env exports are available (Codex can stall without full login env).
-    const tmuxCommand = project.sshHost && AGENT_KINDS.has(kind)
-      ? `"$SHELL" -lic ${shellQuote(`exec ${command}`)}`
-      : command;
-    newSessionArgs.push('-c', sessionPath, tmuxCommand);
+    // Remote sessions should run inside the user's native interactive shell.
+    // Start a plain tmux shell and inject startup commands via send-keys so
+    // csh/zsh/bash environments behave consistently.
+    if (defaultTmuxShell) {
+      // Let tmux launch its own default shell in the target directory.
+      newSessionArgs.push('-c', sessionPath);
+    } else {
+      if (project.sshHost) {
+        newSessionArgs.push('-c', sessionPath);
+      } else {
+        const launchScript = setup ? `${setup}\nexec ${command}` : `exec ${command}`;
+        const tmuxCommand = `/bin/sh -lc ${shellQuote(launchScript)}`;
+        newSessionArgs.push('-c', sessionPath, tmuxCommand);
+      }
+    }
     await runTmuxForProject(project, newSessionArgs, sessionPath);
+    if (project.sshHost) {
+      const startupLines = [];
+      if (setup) {
+        startupLines.push(
+          ...setup
+            .split('\n')
+            .map((line) => String(line || '').trim())
+            .filter(Boolean)
+        );
+      }
+      if (!defaultTmuxShell) {
+        startupLines.push(command);
+      }
+      if (startupLines.length) {
+        await new Promise((resolve) => setTimeout(resolve, 180));
+        for (const line of startupLines) {
+          await runTmuxForProject(project, ['send-keys', '-t', tmuxName, '-l', line], sessionPath);
+          await runTmuxForProject(project, ['send-keys', '-t', tmuxName, 'C-m'], sessionPath);
+        }
+      }
+    }
     try {
       // Reinforce global tmux history depth in case user config overrides it low.
       await runTmuxForProject(project, ['set-window-option', '-g', 'history-limit', TMUX_HISTORY_LIMIT_LINES], sessionPath);
+      // Eliminate escape-time delay so arrow key escape sequences are recognized
+      // immediately rather than being split into Escape + literal text.
+      await runTmuxForProject(project, ['set-option', '-s', 'escape-time', '0'], sessionPath);
       // Apply mouse mode after server/session creation so first launch works on hosts
       // where no tmux socket exists yet.
       await runTmuxForProject(project, ['set-option', '-t', tmuxName, 'mouse', 'off'], sessionPath);
@@ -353,6 +577,24 @@ export async function spawnSession({ project, kind, rawCommand, prompt, workspac
         await runTmuxForProject(project, ['send-keys', '-t', tmuxName, 'C-m'], sessionPath);
       } catch {
         // Ignore prompt preload failures; session is already running.
+      }
+    }
+
+    if (kind === 'tmux') {
+      await new Promise((resolve) => setTimeout(resolve, project.sshHost ? 900 : 300));
+      let alive = await tmuxSessionExists(project, tmuxName);
+      if (!alive && project.sshHost) {
+        await new Promise((resolve) => setTimeout(resolve, 900));
+        alive = await tmuxSessionExists(project, tmuxName);
+      }
+      if (!alive) {
+        const where = project.sshHost ? `${project.sshHost}:${project.path}` : project.path;
+        const error = new Error(
+          `tmux exited immediately after launch in ${where}. Verify the default shell and environment in that directory.`
+        );
+        error.code = 'TMUX_EXITED_EARLY';
+        error.kind = kind;
+        throw error;
       }
     }
 

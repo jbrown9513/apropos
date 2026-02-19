@@ -26,6 +26,7 @@ const state = {
   focusQueueIndex: 0,
   focusFallbackSessionId: '',
   focusFallbackSessionIdByProject: {},
+  focusPinnedSessionIdByProject: {},
   projectSwitcherOpen: false,
   mobileContextOpen: false,
   notificationsSeenAt: loadNotificationSeenAt(),
@@ -1123,12 +1124,18 @@ function rouletteSelectionForProject(projectId, sessions = []) {
   };
 }
 
-function focusSessions() {
+function focusSessions(projectId = '') {
   const sessions = Array.isArray(state.dashboard?.sessions) ? state.dashboard.sessions.slice() : [];
-  return sessions.sort(compareSessionsStable);
+  const sorted = sessions.sort(compareSessionsStable);
+  const targetProjectId = String(projectId || '').trim();
+  if (!targetProjectId) {
+    return sorted;
+  }
+  const projectScoped = sorted.filter((session) => String(session.projectId || '') === targetProjectId);
+  return projectScoped.length ? projectScoped : sorted;
 }
 
-function focusNotifications() {
+function focusNotifications(projectId = '') {
   const priority = (alert) => {
     if (alert?.type === 'session.agent_question') {
       return 0;
@@ -1138,13 +1145,19 @@ function focusNotifications() {
     }
     return 2;
   };
-  return notificationAlerts().slice().sort((a, b) => {
+  const sorted = notificationAlerts().slice().sort((a, b) => {
     const priorityDelta = priority(a) - priority(b);
     if (priorityDelta !== 0) {
       return priorityDelta;
     }
     return Date.parse(a.createdAt || 0) - Date.parse(b.createdAt || 0);
   });
+  const targetProjectId = String(projectId || '').trim();
+  if (!targetProjectId) {
+    return sorted;
+  }
+  const projectScoped = sorted.filter((alert) => String(alert?.payload?.projectId || '') === targetProjectId);
+  return projectScoped.length ? projectScoped : sorted;
 }
 
 function focusQueueIndex(total) {
@@ -1189,9 +1202,13 @@ function sessionMatchForNotification(alert, sessions = []) {
   return match;
 }
 
-function pickRandomFocusSession(sessions = [], { avoidSessionId = '' } = {}) {
+function pickRandomFocusSession(sessions = [], { avoidSessionId = '', projectId = '' } = {}) {
+  const targetProjectId = String(projectId || '').trim();
   if (!sessions.length) {
     state.focusFallbackSessionId = '';
+    if (targetProjectId) {
+      delete state.focusFallbackSessionIdByProject[targetProjectId];
+    }
     return null;
   }
   const current = String(avoidSessionId || '').trim();
@@ -1201,77 +1218,148 @@ function pickRandomFocusSession(sessions = [], { avoidSessionId = '' } = {}) {
   const randomIndex = Math.floor(Math.random() * pool.length);
   const selected = pool[randomIndex] || pool[0] || null;
   state.focusFallbackSessionId = selected?.id || '';
+  if (targetProjectId) {
+    state.focusFallbackSessionIdByProject[targetProjectId] = selected?.id || '';
+  }
   return selected;
 }
 
-function focusFallbackSession(sessions = []) {
+function focusFallbackSession(sessions = [], projectId = '') {
+  const targetProjectId = String(projectId || '').trim();
   if (!sessions.length) {
     state.focusFallbackSessionId = '';
+    if (targetProjectId) {
+      delete state.focusFallbackSessionIdByProject[targetProjectId];
+    }
     return null;
   }
-  const existing = sessions.find((session) => session.id === state.focusFallbackSessionId);
+  const preferredId = targetProjectId
+    ? String(state.focusFallbackSessionIdByProject[targetProjectId] || '').trim()
+    : String(state.focusFallbackSessionId || '').trim();
+  const existing = sessions.find((session) => session.id === preferredId);
   if (existing) {
+    state.focusFallbackSessionId = existing.id;
+    if (targetProjectId) {
+      state.focusFallbackSessionIdByProject[targetProjectId] = existing.id;
+    }
     return existing;
   }
-  return pickRandomFocusSession(sessions);
+  return pickRandomFocusSession(sessions, { projectId: targetProjectId });
 }
 
-function focusSelection() {
-  const sessions = focusSessions();
-  const items = focusNotifications();
+function focusSelection(projectId = '', options = {}) {
+  const { respectPinned = true } = options || {};
+  const targetProjectId = String(projectId || '').trim();
+  const sessions = focusSessions(targetProjectId);
+  const items = focusNotifications(targetProjectId);
+  let selection = null;
   if (!items.length) {
-    return {
+    selection = {
       items,
       index: 0,
       alert: null,
-      session: focusFallbackSession(sessions),
+      session: focusFallbackSession(sessions, targetProjectId),
       hasNotificationMatch: true,
       source: 'random'
     };
-  }
-
-  const total = items.length;
-  const start = focusQueueIndex(total);
-  for (let offset = 0; offset < total; offset += 1) {
-    const index = (start + offset) % total;
-    const alert = items[index];
-    const match = sessionMatchForNotification(alert, sessions);
-    if (match) {
-      state.focusQueueIndex = index;
-      return {
+  } else {
+    const total = items.length;
+    const start = focusQueueIndex(total);
+    for (let offset = 0; offset < total; offset += 1) {
+      const index = (start + offset) % total;
+      const alert = items[index];
+      const match = sessionMatchForNotification(alert, sessions);
+      if (match) {
+        state.focusQueueIndex = index;
+        selection = {
+          items,
+          index,
+          alert,
+          session: match,
+          hasNotificationMatch: true,
+          source: 'notification'
+        };
+        break;
+      }
+    }
+    if (!selection) {
+      selection = {
         items,
-        index,
-        alert,
-        session: match,
-        hasNotificationMatch: true,
-        source: 'notification'
+        index: start,
+        alert: items[start] || null,
+        session: focusFallbackSession(sessions, targetProjectId),
+        hasNotificationMatch: false,
+        source: 'random'
       };
     }
   }
 
-  return {
-    items,
-    index: start,
-    alert: items[start] || null,
-    session: focusFallbackSession(sessions),
-    hasNotificationMatch: false,
-    source: 'random'
-  };
+  if (targetProjectId && respectPinned) {
+    const pinnedId = String(state.focusPinnedSessionIdByProject[targetProjectId] || '').trim();
+    if (pinnedId) {
+      const pinned = sessions.find((session) => session.id === pinnedId);
+      if (pinned) {
+        selection = { ...selection, session: pinned };
+      }
+    }
+  }
+
+  if (targetProjectId) {
+    state.focusPinnedSessionIdByProject[targetProjectId] = selection?.session?.id || '';
+  }
+  return selection;
 }
 
 function advanceFocusModeSelection() {
-  const sessions = focusSessions();
-  const items = focusNotifications();
+  const targetProjectId = String(state.activeProjectId || '').trim();
+  const sessions = focusSessions(targetProjectId);
+  const items = focusNotifications(targetProjectId);
   if (items.length > 0) {
     const current = focusQueueIndex(items.length);
     state.focusQueueIndex = (current + 1) % items.length;
     const hasMappedSession = items.some((alert) => Boolean(sessionMatchForNotification(alert, sessions)));
     if (!hasMappedSession) {
-      pickRandomFocusSession(sessions, { avoidSessionId: state.focusFallbackSessionId });
+      pickRandomFocusSession(sessions, {
+        avoidSessionId: state.focusFallbackSessionIdByProject[targetProjectId] || state.focusFallbackSessionId,
+        projectId: targetProjectId
+      });
     }
-    return;
+  } else {
+    pickRandomFocusSession(sessions, {
+      avoidSessionId: state.focusFallbackSessionIdByProject[targetProjectId] || state.focusFallbackSessionId,
+      projectId: targetProjectId
+    });
   }
-  pickRandomFocusSession(sessions, { avoidSessionId: state.focusFallbackSessionId });
+  const next = focusSelection(targetProjectId, { respectPinned: false });
+  state.focusPinnedSessionIdByProject[targetProjectId] = next?.session?.id || '';
+}
+
+function retreatFocusModeSelection() {
+  const targetProjectId = String(state.activeProjectId || '').trim();
+  const sessions = focusSessions(targetProjectId);
+  const items = focusNotifications(targetProjectId);
+  if (items.length > 0) {
+    const current = focusQueueIndex(items.length);
+    state.focusQueueIndex = (current - 1 + items.length) % items.length;
+    const hasMappedSession = items.some((alert) => Boolean(sessionMatchForNotification(alert, sessions)));
+    if (!hasMappedSession) {
+      const currentFallbackId = state.focusFallbackSessionIdByProject[targetProjectId] || state.focusFallbackSessionId;
+      const picked = pickRandomFocusSession(sessions, { avoidSessionId: currentFallbackId, projectId: targetProjectId });
+      state.focusFallbackSessionId = picked?.id || currentFallbackId || '';
+      if (targetProjectId) {
+        state.focusFallbackSessionIdByProject[targetProjectId] = picked?.id || currentFallbackId || '';
+      }
+    }
+  } else if (sessions.length > 0) {
+    const currentFallbackId = state.focusFallbackSessionIdByProject[targetProjectId] || state.focusFallbackSessionId;
+    const picked = pickRandomFocusSession(sessions, { avoidSessionId: currentFallbackId, projectId: targetProjectId });
+    state.focusFallbackSessionId = picked?.id || currentFallbackId || '';
+    if (targetProjectId) {
+      state.focusFallbackSessionIdByProject[targetProjectId] = picked?.id || currentFallbackId || '';
+    }
+  }
+  const next = focusSelection(targetProjectId, { respectPinned: false });
+  state.focusPinnedSessionIdByProject[targetProjectId] = next?.session?.id || '';
 }
 
 function setRouletteModeEnabled(enabled) {
@@ -1602,9 +1690,17 @@ function renderProjects() {
       node.querySelector('.project-meta').textContent += ` | folder: ${assignedFolder.name}`;
     }
     if (project.sshHost) {
-      node.querySelector('.git-badge').textContent = project.isGit ? 'remote git' : 'remote non-git';
+      if (project.workspaceContext?.type === 'provider' && project.workspaceContext?.provider?.name) {
+        node.querySelector('.git-badge').textContent = `remote ${project.workspaceContext.provider.name}`;
+      } else {
+        node.querySelector('.git-badge').textContent = project.isGit ? 'remote git' : 'remote non-git';
+      }
     } else {
-      node.querySelector('.git-badge').textContent = project.isGit ? 'git' : 'non-git';
+      if (project.workspaceContext?.type === 'provider' && project.workspaceContext?.provider?.name) {
+        node.querySelector('.git-badge').textContent = project.workspaceContext.provider.name;
+      } else {
+        node.querySelector('.git-badge').textContent = project.isGit ? 'git' : 'non-git';
+      }
     }
 
     const alertIcon = node.querySelector('.alert-icon');
@@ -1714,6 +1810,24 @@ function teardownAllTerminals() {
   for (const sessionId of state.terminals.keys()) {
     teardownTerminal(sessionId);
   }
+}
+
+function refreshSessionTerminalConnection(sessionId) {
+  const id = String(sessionId || '').trim();
+  if (!id) {
+    return false;
+  }
+  const session = sessionById(id);
+  if (!session) {
+    return false;
+  }
+  const mount = document.querySelector(`[data-terminal-mount="${id}"]`);
+  if (!mount) {
+    return false;
+  }
+  teardownTerminal(id);
+  openLiveTerminal(session, mount);
+  return true;
 }
 
 function sanitizeTerminalStream(data) {
@@ -2006,16 +2120,22 @@ function renderWorkspace() {
   }
 
   const focusMode = state.rouletteModeEnabled;
+  gridRoot.classList.toggle('focus-grid', focusMode);
+  if (focusMode) {
+    gridRoot.style.setProperty('--focus-grid-cols', String(maxTileCols()));
+  } else {
+    gridRoot.style.removeProperty('--focus-grid-cols');
+  }
   const projectSessions = sessionsForActiveProject();
   const rouletteSelection = focusMode
-    ? focusSelection()
+    ? focusSelection(project.id)
     : rouletteSelectionForProject(project.id, projectSessions);
   const selectedSession = rouletteSelection.session;
   const visibleSessions = focusMode
     ? (selectedSession ? [selectedSession] : [])
     : projectSessions;
   const activeSessionIds = new Set(visibleSessions.map((session) => session.id));
-  els.workspaceTitle.textContent = focusMode ? 'Focus mode workspace' : `${project.name} workspace`;
+  els.workspaceTitle.textContent = focusMode ? `${project.name} focus mode` : `${project.name} workspace`;
   renderMcpDropdownMenu();
   renderProjectSwitcher();
 
@@ -2065,6 +2185,9 @@ function renderWorkspace() {
             <button class="small alt tile-size-btn" type="button" data-resize-session="${session.id}" data-axis="y" data-delta="-1" title="Remove height span" data-tooltip="Remove height" aria-label="Remove height span">
               ${lucideIcon('moveVerticalMinus', 'tile-icon')}
             </button>
+            ${session.sshHost && session.kind === 'tmux'
+    ? `<button class="small alt tile-size-btn tile-refresh-btn" type="button" data-refresh-session="${session.id}" title="Refresh terminal connection" data-tooltip="Refresh terminal" aria-label="Refresh terminal connection">↻</button>`
+    : ''}
           `;
       tile.innerHTML = `
         <div class="tile-size-controls" data-size-controls>
@@ -2088,8 +2211,8 @@ function renderWorkspace() {
         <div class="terminal-instance" data-terminal-mount="${session.id}"></div>
         <div class="roulette-footer" data-roulette-footer hidden>
           <div class="mono roulette-message" data-roulette-message></div>
-          <div class="mono focus-source-badge" data-focus-source></div>
           <div class="roulette-controls" data-roulette-controls hidden>
+            <button class="small alt" type="button" data-roulette-nav="prev">PREV</button>
             <button class="small alt" type="button" data-roulette-nav="next">NEXT</button>
           </div>
         </div>
@@ -2116,7 +2239,6 @@ function renderWorkspace() {
     const rouletteFooter = tile.querySelector('[data-roulette-footer]');
     const rouletteMessage = tile.querySelector('[data-roulette-message]');
     const rouletteControls = tile.querySelector('[data-roulette-controls]');
-    const focusSourceBadge = tile.querySelector('[data-focus-source]');
     if (rouletteFooter && rouletteMessage) {
       const enableRouletteFooter = focusMode;
       rouletteFooter.hidden = !enableRouletteFooter;
@@ -2125,19 +2247,13 @@ function renderWorkspace() {
       }
       if (enableRouletteFooter) {
         if (!rouletteSelection.items.length) {
-          rouletteMessage.textContent = 'Focus mode: no notifications yet.';
+          rouletteMessage.textContent = 'Focus mode: no notifications yet for this project.';
         } else if (!rouletteSelection.hasNotificationMatch) {
-          rouletteMessage.textContent = 'Focus mode: notification session is no longer running.';
+          rouletteMessage.textContent = 'Focus mode: notification session for this project is no longer running.';
         } else {
           const labelPrefix = `${rouletteSelection.index + 1}/${rouletteSelection.items.length}`;
           const alert = rouletteSelection.alert;
           rouletteMessage.textContent = `${labelPrefix} ${new Date(alert.createdAt || Date.now()).toLocaleTimeString()} ${notificationMessage(alert)}`;
-        }
-        if (focusSourceBadge) {
-          focusSourceBadge.textContent = rouletteSelection.source === 'notification'
-            ? 'Notification queue'
-            : 'Random fallback';
-          focusSourceBadge.dataset.source = rouletteSelection.source || 'random';
         }
       }
     }
@@ -3095,7 +3211,7 @@ async function openWorkspace(projectId, options = {}) {
   } catch {
     // Ignore ack failures and continue opening workspace.
   }
-  await loadDashboard();
+  await loadDashboard({ mode: 'switch' });
 }
 
 function closeWorkspace(options = {}) {
@@ -3116,8 +3232,10 @@ function closeWorkspace(options = {}) {
   }
 }
 
-async function loadDashboard() {
-  const data = await api('/api/dashboard');
+async function loadDashboard(options = {}) {
+  const mode = String(options?.mode || '').trim().toLowerCase();
+  const query = mode === 'switch' ? '?mode=switch' : '';
+  const data = await api(`/api/dashboard${query}`);
   state.dashboard = data;
   state.projectFolders = Array.isArray(data.projectFolders) ? data.projectFolders : [];
   state.projectFolderByProject = data.projectFolderByProject && typeof data.projectFolderByProject === 'object'
@@ -3155,7 +3273,120 @@ async function spawnSession(projectId, kind) {
     return;
   }
   let workspace = { mode: 'main' };
-  if (project.isGit) {
+  if (project.workspaceContext?.type === 'provider' && project.workspaceContext?.provider?.id) {
+    try {
+      const contextPayload = await api(`/api/projects/${projectId}/workspace-context`);
+      const provider = contextPayload?.context?.provider || project.workspaceContext.provider;
+      const providerName = provider?.name || provider?.id || 'custom workspace';
+      const views = Array.isArray(contextPayload?.views) ? contextPayload.views : [];
+      let selectedValue = 'main';
+      let existingViewInput = null;
+      let createViewInput = null;
+      const result = await openModalBase({
+        title: `Start ${kind}`,
+        submitLabel: 'Start',
+        cancelLabel: 'Cancel',
+        bodyBuilder: (body) => {
+          const desc = document.createElement('p');
+          desc.textContent = `Choose launch location for ${providerName}.`;
+          body.appendChild(desc);
+
+          const picker = document.createElement('div');
+          picker.className = 'workspace-picker';
+          const pickerItems = [
+            { value: 'main', name: 'Default path', detail: project.path, icon: 'home' },
+            { value: 'provider-view', name: 'Use existing view', detail: views.length ? `${views.length} discovered` : 'Enter view name', icon: 'branch' },
+            { value: 'provider-create', name: 'Create new view', detail: 'Create and use a new ADE view', icon: 'plus' }
+          ];
+
+          const wpIcons = {
+            home: '<svg class="wp-icon" viewBox="0 0 24 24"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>',
+            branch: '<svg class="wp-icon" viewBox="0 0 24 24"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></svg>',
+            plus: '<svg class="wp-icon" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="16"/><line x1="8" y1="12" x2="16" y2="12"/></svg>'
+          };
+
+          for (const pi of pickerItems) {
+            const opt = document.createElement('div');
+            opt.className = 'workspace-picker-option' + (pi.value === selectedValue ? ' selected' : '');
+            opt.dataset.value = pi.value;
+            opt.innerHTML = `
+              ${wpIcons[pi.icon] || ''}
+              <div class="wp-body">
+                <div class="wp-name">${pi.name}</div>
+                <div class="wp-detail">${pi.detail}</div>
+              </div>
+              <div class="wp-check"></div>
+            `;
+            opt.addEventListener('click', () => {
+              selectedValue = pi.value;
+              for (const el of picker.querySelectorAll('.workspace-picker-option')) {
+                el.classList.toggle('selected', el.dataset.value === pi.value);
+              }
+              if (existingViewInput) {
+                existingViewInput.parentElement.hidden = selectedValue !== 'provider-view';
+              }
+              if (createViewInput) {
+                createViewInput.parentElement.hidden = selectedValue !== 'provider-create';
+              }
+            });
+            picker.appendChild(opt);
+          }
+          body.appendChild(picker);
+
+          const existingLabel = document.createElement('label');
+          existingLabel.textContent = 'Existing view name';
+          existingViewInput = document.createElement('input');
+          existingViewInput.type = 'text';
+          existingViewInput.placeholder = 'joshuabr_main';
+          if (views.length) {
+            const list = document.createElement('datalist');
+            list.id = 'workspace-provider-views-list';
+            for (const view of views) {
+              const option = document.createElement('option');
+              option.value = String(view);
+              list.appendChild(option);
+            }
+            body.appendChild(list);
+            existingViewInput.setAttribute('list', 'workspace-provider-views-list');
+            existingViewInput.value = String(views[0] || '');
+          }
+          existingLabel.hidden = true;
+          existingLabel.appendChild(existingViewInput);
+          body.appendChild(existingLabel);
+
+          const createLabel = document.createElement('label');
+          createLabel.textContent = 'New view name';
+          createViewInput = document.createElement('input');
+          createViewInput.type = 'text';
+          createViewInput.placeholder = 'my_new_view';
+          createLabel.hidden = true;
+          createLabel.appendChild(createViewInput);
+          body.appendChild(createLabel);
+        }
+      });
+      if (result !== 'submit') {
+        return;
+      }
+      if (selectedValue === 'provider-view') {
+        const name = String(existingViewInput?.value || '').trim();
+        if (!name) {
+          await modalMessage('View name is required.', { title: 'Missing field' });
+          return;
+        }
+        workspace = { mode: 'provider-view', name };
+      } else if (selectedValue === 'provider-create') {
+        const name = String(createViewInput?.value || '').trim();
+        if (!name) {
+          await modalMessage('New view name is required.', { title: 'Missing field' });
+          return;
+        }
+        workspace = { mode: 'provider-create', name };
+      }
+    } catch (error) {
+      await modalMessage(error.message, { title: 'Workspace options unavailable' });
+      return;
+    }
+  } else if (project.isGit) {
     try {
       const payload = await api(`/api/projects/${projectId}/worktrees`);
       const worktrees = Array.isArray(payload?.worktrees) ? payload.worktrees : [];
@@ -3364,7 +3595,9 @@ async function promptRunAutomation(projectId) {
       return;
     }
 
-    const fields = [
+    // Step 1: pick automation
+    const anyHasParams = automations.some((a) => Array.isArray(a.params) && a.params.length);
+    const pickerFields = [
       {
         id: 'automationId',
         label: 'Automation',
@@ -3379,8 +3612,8 @@ async function promptRunAutomation(projectId) {
     ];
     const selected = await modalForm({
       title: 'Run Automation',
-      submitLabel: 'Run',
-      fields
+      submitLabel: anyHasParams ? 'Next' : 'Run',
+      fields: pickerFields
     });
     if (!selected) {
       return;
@@ -3392,9 +3625,32 @@ async function promptRunAutomation(projectId) {
       return;
     }
 
+    // Step 2: collect input params if the automation declares any
+    const params = Array.isArray(chosen.params) ? chosen.params : [];
+    let inputParams = {};
+    if (params.length) {
+      const paramFields = params.map((p) => ({
+        id: p.name,
+        label: p.label || p.name,
+        type: 'text',
+        value: p.default || '',
+        placeholder: p.required ? 'required' : 'optional',
+        required: p.required
+      }));
+      const paramValues = await modalForm({
+        title: `${chosen.name} — Parameters`,
+        submitLabel: 'Run',
+        fields: paramFields
+      });
+      if (!paramValues) {
+        return;
+      }
+      inputParams = paramValues;
+    }
+
     const runResult = await api(`/api/projects/${projectId}/automations/run`, {
       method: 'POST',
-      body: JSON.stringify({ automationId: chosen.id })
+      body: JSON.stringify({ automationId: chosen.id, inputParams })
     });
     await loadDashboard();
   } catch (error) {
@@ -4176,7 +4432,11 @@ els.terminalGrid.addEventListener('click', async (event) => {
     if (!state.rouletteModeEnabled) {
       return;
     }
-    advanceFocusModeSelection();
+    if (rouletteButton.dataset.rouletteNav === 'prev') {
+      retreatFocusModeSelection();
+    } else {
+      advanceFocusModeSelection();
+    }
     renderWorkspace();
     return;
   }
@@ -4197,6 +4457,17 @@ els.terminalGrid.addEventListener('click', async (event) => {
     renderWorkspace();
     return;
   }
+  const refreshButton = event.target.closest('button[data-refresh-session]');
+  if (refreshButton) {
+    event.stopPropagation();
+    const refreshed = refreshSessionTerminalConnection(refreshButton.dataset.refreshSession);
+    if (refreshed) {
+      showToast('Terminal connection refreshed.', 1500);
+    } else {
+      await loadDashboard();
+    }
+    return;
+  }
   const stopButton = event.target.closest('button[data-stop-session]');
   if (stopButton) {
     await api(`/api/sessions/${stopButton.dataset.stopSession}`, { method: 'DELETE' });
@@ -4210,7 +4481,11 @@ els.terminalGridSplit?.addEventListener('click', async (event) => {
     if (!state.rouletteModeEnabled) {
       return;
     }
-    advanceFocusModeSelection();
+    if (rouletteButton.dataset.rouletteNav === 'prev') {
+      retreatFocusModeSelection();
+    } else {
+      advanceFocusModeSelection();
+    }
     renderWorkspace();
     return;
   }
@@ -4218,6 +4493,17 @@ els.terminalGridSplit?.addEventListener('click', async (event) => {
   if (stopButton) {
     await api(`/api/sessions/${stopButton.dataset.stopSession}`, { method: 'DELETE' });
     await loadDashboard();
+    return;
+  }
+  const refreshButton = event.target.closest('button[data-refresh-session]');
+  if (refreshButton) {
+    event.stopPropagation();
+    const refreshed = refreshSessionTerminalConnection(refreshButton.dataset.refreshSession);
+    if (refreshed) {
+      showToast('Terminal connection refreshed.', 1500);
+    } else {
+      await loadDashboard();
+    }
     return;
   }
   const resizeButton = event.target.closest('button[data-resize-session]');
@@ -4359,10 +4645,13 @@ function attachSessionGridDragAndDrop(gridRoot) {
     const dragged = gridRoot.querySelector(`[data-session-id="${state.draggingSessionId}"]`);
     if (dragged) {
       dragged.classList.remove('dragging');
-      dragged.classList.add('snap-locked');
-      setTimeout(() => {
-        dragged.classList.remove('snap-locked');
-      }, 70);
+      dragged.classList.remove('snap-locked');
+      dragged.style.transition = 'none';
+      dragged.style.transform = 'none';
+      // Force immediate visual reset at drop release.
+      void dragged.offsetWidth;
+      dragged.style.transition = '';
+      dragged.style.transform = '';
     }
     gridRoot.classList.remove('drag-active');
     state.draggingSessionId = null;
