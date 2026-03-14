@@ -1864,7 +1864,7 @@ function openLiveTerminal(session, mount) {
   const term = new Terminal({
     cols: WORKSPACE_TERM_COLS,
     rows: WORKSPACE_TERM_ROWS,
-    scrollback: 50000,
+    scrollback: 100000,
     fontSize: 13,
     fontFamily: 'IBM Plex Mono, Menlo, monospace',
     cursorBlink: true,
@@ -2034,8 +2034,13 @@ function openLiveTerminal(session, mount) {
       // some terminal/PTY combinations.
       const historyText = String(payload.data || '');
       if (historyText) {
-        term.write(`${historyText}\r\n`);
-        term.scrollToBottom();
+        // Hide terminal during history injection to prevent visible scroll-through.
+        const el = term.element;
+        if (el) el.style.visibility = 'hidden';
+        term.write(`${historyText}\r\n`, () => {
+          term.scrollToBottom();
+          if (el) el.style.visibility = '';
+        });
       }
       return;
     }

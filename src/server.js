@@ -55,8 +55,8 @@ const SSH_SHARED_ARGS = [
 const AGENT_SESSION_KINDS = new Set(['codex', 'claude', 'cursor', 'opencode']);
 const AGENT_IDLE_MS = 2600;
 const REMOTE_AGENT_POLL_INTERVAL_MS = 7000;
-const TERMINAL_INITIAL_SCROLLBACK_LINES = 20000;
-const TMUX_HISTORY_LIMIT_LINES = 50000;
+const TERMINAL_INITIAL_SCROLLBACK_LINES = 50000;
+const TMUX_HISTORY_LIMIT_LINES = 100000;
 const DASHBOARD_SWITCH_SESSION_REFRESH_MIN_MS = 3500;
 const DASHBOARD_PROJECT_CACHE_TTL_MS = 15000;
 const ENABLE_REMOTE_PTY_ATTACH = process.env.APROPOS_ENABLE_REMOTE_PTY_ATTACH !== '0';
@@ -2033,10 +2033,18 @@ app.post('/api/projects', async (req, res) => {
   }
 
   try {
-    const normalizedProjectPath = String(projectPath).trim();
+    let normalizedProjectPath = String(projectPath).trim();
     let detectedIsGit = false;
     let scaffold;
     if (remoteHost) {
+      // Resolve relative paths to absolute on the remote host so tmux -c and
+      // all downstream directory operations use a stable absolute path.
+      if (normalizedProjectPath && !normalizedProjectPath.startsWith('/')) {
+        const resolved = await runSsh(remoteHost, `cd ${shellQuote(normalizedProjectPath)} && pwd`).catch(() => '');
+        if (resolved) {
+          normalizedProjectPath = resolved;
+        }
+      }
       detectedIsGit = await detectIsGitRepoRemote(remoteHost, normalizedProjectPath);
       scaffold = await ensureProjectLayoutRemote(remoteHost, normalizedProjectPath);
     } else {

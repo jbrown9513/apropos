@@ -39,7 +39,7 @@ Use these command mappings when operating on repository actions.
 ## Plugin Workflow Rules
 
 - Environment: ADE is authoritative for source control workflows in this project when ADE provider is detected.
-- Before editing tracked files in ADE views, run: ade co -nc <file> (Apropos defaults to ade co -nc . at session start).
+- Do not run bulk checkout by default. Checkout files individually before editing: ade co -nc <file>.
 - For transaction file summaries with unified diffs, prefer: ade describetrans -short -diff_txn_changes -unified_diff_format -diffs_only.
 - For per-file unified diff against label, prefer: ade diff -label -unified_diff_format <file>.
 - Use ADE transaction operations (begintrans/ci/unbranch/unmkelem/beginmerge/mergetrans/endmerge) instead of git branch/commit/merge semantics.

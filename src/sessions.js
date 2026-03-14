@@ -14,7 +14,7 @@ const REMOTE_TMUX_CANDIDATES = [
   '/usr/local/bin/tmux',
   '/usr/bin/tmux'
 ].filter(Boolean);
-const TMUX_HISTORY_LIMIT_LINES = '50000';
+const TMUX_HISTORY_LIMIT_LINES = '100000';
 const AGENT_INSTALL_DOCS = {
   codex: 'https://github.com/openai/codex',
   claude: 'https://docs.anthropic.com/en/docs/claude-code/quickstart',
@@ -126,10 +126,9 @@ function runTmuxLocal(args, cwd) {
   });
 }
 
-function runTmuxRemote(sshHost, args, cwd) {
-  const argsQuoted = args.map((arg) => shellQuote(arg)).join(' ');
+function tmuxDiscoveryPreamble() {
   const candidates = REMOTE_TMUX_CANDIDATES.map((candidate) => shellQuote(candidate)).join(' ');
-  const command = [
+  return [
     "tmux_bin=\"$(command -v tmux 2>/dev/null || true)\"",
     'if [ -z "$tmux_bin" ]; then',
     `  for candidate in ${candidates}; do`,
@@ -139,10 +138,33 @@ function runTmuxRemote(sshHost, args, cwd) {
     'if [ -z "$tmux_bin" ]; then',
     '  echo "tmux not found on remote host PATH. Install tmux or set TMUX_BIN_REMOTE." >&2',
     '  exit 127',
-    'fi',
+    'fi'
+  ];
+}
+
+function runTmuxRemote(sshHost, args, cwd) {
+  const argsQuoted = args.map((arg) => shellQuote(arg)).join(' ');
+  const command = [
+    ...tmuxDiscoveryPreamble(),
     `"$tmux_bin" ${argsQuoted}`
   ].join('\n');
   return runSsh(sshHost, command, cwd);
+}
+
+// Run multiple tmux commands in a single SSH call to avoid per-command
+// connection overhead.  Each entry in `commandsList` is an array of args
+// (same format as runTmuxRemote).  Commands that fail are silently ignored
+// unless `strict` is true.
+function runTmuxBatchRemote(sshHost, commandsList, cwd, { strict = false } = {}) {
+  if (!commandsList.length) {
+    return Promise.resolve('');
+  }
+  const lines = [...tmuxDiscoveryPreamble()];
+  for (const args of commandsList) {
+    const argsQuoted = args.map((arg) => shellQuote(arg)).join(' ');
+    lines.push(strict ? `"$tmux_bin" ${argsQuoted}` : `"$tmux_bin" ${argsQuoted} 2>/dev/null || true`);
+  }
+  return runSsh(sshHost, lines.join('\n'), cwd);
 }
 
 function runTmuxForProject(project, args, cwd) {
@@ -449,7 +471,19 @@ export async function refreshSessions(projectLookup, projects = []) {
 }
 
 export async function spawnSession({ project, kind, rawCommand, prompt, setupScript, workspacePath, workspaceName }) {
-  const sessionPath = String(workspacePath || project.path || '').trim() || project.path;
+  let sessionPath = String(workspacePath || project.path || '').trim() || project.path;
+  // Resolve relative paths to absolute on remote hosts so tmux -c and cd both
+  // work correctly regardless of the tmux server's current directory.
+  if (project.sshHost && sessionPath && !sessionPath.startsWith('/')) {
+    try {
+      const resolved = await runSsh(project.sshHost, `cd ${shellQuote(sessionPath)} && pwd`);
+      if (resolved) {
+        sessionPath = resolved;
+      }
+    } catch {
+      // Fall through; the cd via send-keys will still handle relative paths.
+    }
+  }
   const sessionWorkspaceName = String(workspaceName || 'main').trim() || 'main';
   const setup = String(setupScript || '').trim();
   const defaultTmuxShell = kind === 'tmux' && !String(rawCommand || '').trim();
@@ -516,51 +550,40 @@ export async function spawnSession({ project, kind, rawCommand, prompt, setupScr
       }
     }
     await runTmuxForProject(project, newSessionArgs, sessionPath);
+
+    // Build all post-creation tmux commands.  For remote sessions these are
+    // batched into a single SSH call to avoid per-command connection overhead.
+    const sendKeysCommands = [];
     if (project.sshHost) {
-      const startupLines = [];
-      if (setup) {
-        startupLines.push(
-          ...setup
-            .split('\n')
-            .map((line) => String(line || '').trim())
-            .filter(Boolean)
-        );
-      }
-      if (!defaultTmuxShell) {
-        startupLines.push(command);
-      }
-      if (startupLines.length) {
-        await new Promise((resolve) => setTimeout(resolve, 180));
-        for (const line of startupLines) {
-          await runTmuxForProject(project, ['send-keys', '-t', tmuxName, '-l', line], sessionPath);
-          await runTmuxForProject(project, ['send-keys', '-t', tmuxName, 'C-m'], sessionPath);
-        }
+      // Explicitly cd into the session path so the shell lands in the correct
+      // directory even when the remote profile (.bashrc/.zshrc) overrides the
+      // working directory that tmux set via its -c flag.  Use `clear` to hide
+      // the cd noise so the session starts with a clean terminal.
+      sendKeysCommands.push(['send-keys', '-t', tmuxName, '-l', `cd ${shellQuote(sessionPath)} && clear`]);
+      sendKeysCommands.push(['send-keys', '-t', tmuxName, 'C-m']);
+    }
+    if (project.sshHost && setup) {
+      for (const line of setup.split('\n').map((l) => String(l || '').trim()).filter(Boolean)) {
+        sendKeysCommands.push(['send-keys', '-t', tmuxName, '-l', line]);
+        sendKeysCommands.push(['send-keys', '-t', tmuxName, 'C-m']);
       }
     }
-    try {
-      // Reinforce global tmux history depth in case user config overrides it low.
-      await runTmuxForProject(project, ['set-window-option', '-g', 'history-limit', TMUX_HISTORY_LIMIT_LINES], sessionPath);
-      // Eliminate escape-time delay so arrow key escape sequences are recognized
-      // immediately rather than being split into Escape + literal text.
-      await runTmuxForProject(project, ['set-option', '-s', 'escape-time', '0'], sessionPath);
-      // Apply mouse mode after server/session creation so first launch works on hosts
-      // where no tmux socket exists yet.
-      await runTmuxForProject(project, ['set-option', '-t', tmuxName, 'mouse', 'off'], sessionPath);
-      // Hide the tmux status bar in embedded terminals to avoid bright bottom bars.
-      await runTmuxForProject(project, ['set-option', '-t', tmuxName, 'status', 'off'], sessionPath);
-      await runTmuxForProject(project, ['set-window-option', '-t', tmuxName, 'history-limit', TMUX_HISTORY_LIMIT_LINES], sessionPath);
-      if (AGENT_KINDS.has(kind)) {
-        // Keep full-screen agent UIs in the main pane history so browser scrollback
-        // can reveal prior output instead of a short alternate-screen buffer.
-        await runTmuxForProject(project, ['set-window-option', '-t', tmuxName, 'alternate-screen', 'off'], sessionPath);
-      }
-    } catch {
-      // Ignore optional tmux UI setting failures.
+    if (project.sshHost && !defaultTmuxShell && command) {
+      sendKeysCommands.push(['send-keys', '-t', tmuxName, '-l', command]);
+      sendKeysCommands.push(['send-keys', '-t', tmuxName, 'C-m']);
     }
 
+    const settingsCommands = [
+      ['set-window-option', '-g', 'history-limit', TMUX_HISTORY_LIMIT_LINES],
+      ['set-option', '-s', 'escape-time', '0'],
+      ['set-option', '-t', tmuxName, 'mouse', 'off'],
+      ['set-option', '-t', tmuxName, 'status', 'off'],
+      ['set-window-option', '-t', tmuxName, 'history-limit', TMUX_HISTORY_LIMIT_LINES]
+    ];
+    if (AGENT_KINDS.has(kind)) {
+      settingsCommands.push(['set-window-option', '-t', tmuxName, 'alternate-screen', 'off']);
+    }
     if (tmuxWidth || tmuxHeight) {
-      // Some tmux versions ignore `new-session -x/-y` depending on client state.
-      // Force the window size after session creation when explicit dimensions are set.
       const resizeArgs = ['resize-window', '-t', tmuxName];
       if (tmuxWidth) {
         resizeArgs.push('-x', tmuxWidth);
@@ -568,15 +591,34 @@ export async function spawnSession({ project, kind, rawCommand, prompt, setupScr
       if (tmuxHeight) {
         resizeArgs.push('-y', tmuxHeight);
       }
-      await runTmuxForProject(project, resizeArgs, sessionPath);
+      settingsCommands.push(resizeArgs);
     }
 
     if (AGENT_KINDS.has(kind) && normalizedPrompt && !promptInjectedInCommand) {
+      sendKeysCommands.push(['send-keys', '-t', tmuxName, '-l', normalizedPrompt]);
+      sendKeysCommands.push(['send-keys', '-t', tmuxName, 'C-m']);
+    }
+
+    if (project.sshHost) {
+      // Batch send-keys + settings into a single SSH call.
+      // Wait long enough for the remote shell to fully initialize its profile
+      // scripts so send-keys text isn't buffered and echo'd before the prompt.
+      if (sendKeysCommands.length) {
+        await new Promise((resolve) => setTimeout(resolve, 600));
+      }
       try {
-        await runTmuxForProject(project, ['send-keys', '-t', tmuxName, '-l', normalizedPrompt], sessionPath);
-        await runTmuxForProject(project, ['send-keys', '-t', tmuxName, 'C-m'], sessionPath);
+        await runTmuxBatchRemote(project.sshHost, [...sendKeysCommands, ...settingsCommands], sessionPath);
       } catch {
-        // Ignore prompt preload failures; session is already running.
+        // Ignore optional tmux setting failures.
+      }
+    } else {
+      // Local: run settings sequentially (fast, no SSH overhead).
+      try {
+        for (const args of settingsCommands) {
+          await runTmuxLocal(args);
+        }
+      } catch {
+        // Ignore optional tmux UI setting failures.
       }
     }
 
